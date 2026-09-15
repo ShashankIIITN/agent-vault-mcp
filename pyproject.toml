@@ -1,0 +1,12 @@
+[project]
+name = "agent-vault-mcp"
+version = "0.1.0"
+description = "DSA-Optimized AI Knowledge Bank MCP Server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp",
+]
+
+[project.scripts]
+agent-vault = "agent_vault.server:main"
