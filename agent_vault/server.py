@@ -99,6 +99,32 @@ def vault_evict_file(filepath: str) -> str:
     storage.evict_file(filepath)
     return f"File '{filepath}' evicted successfully."
 
+@mcp.tool()
+def vault_cache_answer(prompt: str, response: str, dependencies: list[str]) -> str:
+    """Cache an AI response with its file dependencies.
+    
+    Args:
+        prompt: The user's prompt.
+        response: The AI's generated response.
+        dependencies: A list of absolute or relative file paths this response depends on.
+    """
+    storage.cache_answer(prompt, response, dependencies)
+    return "Answer cached successfully."
+
+@mcp.tool()
+def vault_search_answer(prompt: str) -> str:
+    """Search for a cached AI response based on a prompt.
+    Checks if dependency files have changed since caching.
+    
+    Args:
+        prompt: The user's prompt.
+    """
+    result = storage.search_answer(prompt)
+    if result:
+        return f"Cached Answer:\n{result}"
+    else:
+        return "No valid cached answer found."
+
 def main():
     mcp.run()
 

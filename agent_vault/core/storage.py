@@ -55,6 +55,16 @@ class VaultStorage:
             columns = [col[1] for col in cursor.fetchall()]
             if 'reason' not in columns:
                 self.conn.execute('ALTER TABLE metrics ADD COLUMN reason TEXT')
+
+            # Prompt cache table
+            self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS prompt_cache (
+                    id INTEGER PRIMARY KEY,
+                    query_hash TEXT UNIQUE,
+                    response TEXT,
+                    dependency_files TEXT
+                )
+            ''')
             
         # Hydrate bloom filter with existing files
         try:
@@ -214,3 +224,57 @@ class VaultStorage:
             f"Estimated Time Saved: {time_saved_str}\n"
             f"==========================="
         )
+
+    def cache_answer(self, prompt, response, dependencies):
+        import hashlib
+        import json
+        query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        deps_json = json.dumps([os.path.relpath(d) for d in dependencies])
+        with self.conn:
+            self.conn.execute("DELETE FROM prompt_cache WHERE query_hash = ?", (query_hash,))
+            self.conn.execute('''
+                INSERT INTO prompt_cache (query_hash, response, dependency_files)
+                VALUES (?, ?, ?)
+            ''', (query_hash, response, deps_json))
+        return True
+
+    def search_answer(self, prompt):
+        import hashlib
+        import json
+        query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        
+        cursor = self.conn.execute(
+            "SELECT id, response, dependency_files FROM prompt_cache WHERE query_hash = ?", 
+            (query_hash,)
+        )
+        rows = cursor.fetchall()
+        
+        for row in rows:
+            row_id, response, deps_json = row
+            dependencies = json.loads(deps_json)
+            
+            is_valid = True
+            for filepath in dependencies:
+                # Get current digest from disk
+                current_digest, _ = get_file_digest(filepath)
+                if not current_digest:
+                    is_valid = False
+                    break
+                    
+                # Get cached digest from file_cache
+                c = self.conn.execute("SELECT digest FROM file_cache WHERE filepath = ?", (filepath,))
+                cached_row = c.fetchone()
+                
+                if not cached_row or cached_row[0] != current_digest:
+                    is_valid = False
+                    break
+                    
+            if is_valid:
+                return response
+            else:
+                # Evict stale cache entry
+                with self.conn:
+                    self.conn.execute("DELETE FROM prompt_cache WHERE id = ?", (row_id,))
+                    
+        return None
+
