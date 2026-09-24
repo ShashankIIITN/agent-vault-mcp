@@ -16,10 +16,11 @@ When the agent wants to check a file, the Vault hashes it (SHA-256). If it hasn'
 - **Token-Bounded MinHeap**: Ranks the best context snippets and strictly cuts off when the maximum token limit is reached, protecting the context window.
 - **SQLite FTS5 (BM25)**: Fast lexical and semantic search for symbols, errors, and flows.
 - **ROI Telemetry**: Natively calculates and tracks how many tokens and hours of inference time are saved by skipping raw file reads.
+- **100% Portable**: Caches are stored using relative paths, meaning you can move or rename your project folder without breaking the vault.
 
 ## Dependencies
 - Python 3.10+
-- `mcp` (Official Model Context Protocol SDK)
+- `mcp` (Official Model Context Protocol SDK, `mcp>=2,<3`)
 - Standard library components (`sqlite3`, `hashlib`, `heapq`)
 
 ## Installation
@@ -59,9 +60,35 @@ To add this to an MCP client like Antigravity, add the following to your `mcp_co
 ```
 *Note: If you used a virtual environment, change `"command": "python"` to the absolute path of the python executable inside `.venv`.*
 
+### Adoption (Forcing the AI to use it)
+The Vault only saves tokens if the AI remembers to use it! Add this snippet to your project's `CLAUDE.md`, `.cursorrules`, or `GEMINI.md`:
+
+```markdown
+# Memory & Context Rules
+You have access to the AgentVault MCP tools. You must manage your memory proactively to save tokens:
+1. **Before reading any file:** ALWAYS call `vault_check_file(filepath)` first. Only read the raw file if the vault misses.
+2. **After analyzing a file:** ALWAYS call `vault_cache_file(filepath, summary)` to save a concise AST/summary.
+3. **At the end of a complex task:** ALWAYS call `vault_store_memory` to log architectural decisions.
+```
+
+## Local vs Global Vaults
+
+By default, the MCP server creates `agent_vault.db` inside your current active project workspace. Paths are stored **relatively**. This means if you ask the agent about a file in an external project (e.g., `../Project_B/main.py`), that cross-project memory is stored locally inside your current project's database.
+
+If you prefer a **"Global Brain"** that shares all memories and file caches across every single project on your computer, simply add `AGENT_VAULT_DB_PATH` to the `env` variables in your `mcp_config.json`:
+
+```json
+"env": {
+  "PYTHONPATH": "/absolute/path/to/agent-vault-mcp",
+  "AGENT_VAULT_DB_PATH": "/absolute/path/to/.global_agent_vault.db"
+}
+```
+
 ## Available MCP Tools
 - `vault_store_memory(key, content, tags)`: Save arbitrary architectural notes or debugging insights.
 - `vault_search(query, max_tokens)`: Search the vault using BM25 ranking.
 - `vault_cache_file(filepath, summary)`: Hash a file and cache its summary.
-- `vault_check_file(filepath)`: Verify a file's hash and return its cached summary.
+- `vault_check_file(filepath)`: Verify a file's hash and return its cached summary + telemetry metrics.
 - `vault_stats()`: View the ROI dashboard of tokens and time saved.
+- `vault_delete_memory(key)`: Delete a stored memory.
+- `vault_evict_file(filepath)`: Evict a file from the vault cache.

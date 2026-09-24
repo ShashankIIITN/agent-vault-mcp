@@ -7,6 +7,12 @@ class VaultStorage:
     def __init__(self, db_path="vault.db"):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        try:
+            os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA busy_timeout=5000;")
         self.bloom_filter = BloomFilter()
         self._init_db()
 
@@ -40,9 +46,15 @@ class VaultStorage:
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     filepath TEXT,
                     is_hit BOOLEAN,
-                    tokens_saved INTEGER
+                    tokens_saved INTEGER,
+                    reason TEXT
                 )
             ''')
+            # Handle schema migration for metrics safely
+            cursor = self.conn.execute("PRAGMA table_info(metrics)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'reason' not in columns:
+                self.conn.execute('ALTER TABLE metrics ADD COLUMN reason TEXT')
             
         # Hydrate bloom filter with existing files
         try:
@@ -110,15 +122,22 @@ class VaultStorage:
             
         return heap.get_items()
 
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+    def delete_memory(self, key):
+        with self.conn:
+            self.conn.execute("DELETE FROM memories WHERE key = ?", (key,))
+
+    def evict_file(self, filepath):
+        with self.conn:
+            self.conn.execute("DELETE FROM file_cache WHERE filepath = ?", (filepath,))
+
     def cache_file(self, filepath, summary):
-        digest = get_file_digest(filepath)
+        digest, raw_file_size = get_file_digest(filepath)
         if not digest:
             return False
-            
-        try:
-            raw_file_size = os.path.getsize(filepath)
-        except OSError:
-            raw_file_size = 0
             
         raw_tokens = raw_file_size // 4
         summary_tokens = len(summary) // 4
@@ -141,14 +160,14 @@ class VaultStorage:
         # 1. Fast rejection
         if not self.bloom_filter.check(filepath):
             with self.conn:
-                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved) VALUES (?, 0, 0)", (filepath,))
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "not_in_bloom"))
             return {"cached": False, "reason": "Not in bloom filter"}
             
         # 2. Check digest
-        current_digest = get_file_digest(filepath)
+        current_digest, _ = get_file_digest(filepath)
         if not current_digest:
              with self.conn:
-                 self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved) VALUES (?, 0, 0)", (filepath,))
+                 self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "not_found"))
              return {"cached": False, "reason": "File not found or unreadable"}
              
         cursor = self.conn.execute("SELECT digest, summary, tokens_saved_per_hit FROM file_cache WHERE filepath = ?", (filepath,))
@@ -156,17 +175,17 @@ class VaultStorage:
         
         if not row:
             with self.conn:
-                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved) VALUES (?, 0, 0)", (filepath,))
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "not_in_db"))
             return {"cached": False, "reason": "Not in database"}
             
         cached_digest, summary, tokens_saved_per_hit = row
         if current_digest == cached_digest:
             with self.conn:
-                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved) VALUES (?, 1, ?)", (filepath, tokens_saved_per_hit))
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 1, ?, ?)", (filepath, tokens_saved_per_hit, "hit"))
             return {"cached": True, "summary": summary, "tokens_saved": tokens_saved_per_hit}
         else:
             with self.conn:
-                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved) VALUES (?, 0, 0)", (filepath,))
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "digest_mismatch"))
             return {"cached": False, "reason": "Digest mismatch"}
 
     def get_metrics_dashboard(self):

@@ -3,7 +3,7 @@ import os
 import heapq
 
 class BloomFilter:
-    def __init__(self, size=100000, hash_count=5):
+    def __init__(self, size=1000000, hash_count=5):
         self.size = size
         self.hash_count = hash_count
         self.bit_array = [False] * size
@@ -56,14 +56,16 @@ class TokenBoundedMinHeap:
         return [x[3] for x in sorted_items]
 
 def get_file_digest(filepath):
-    """Returns SHA-256 digest of a file, or None if it doesn't exist."""
+    """Returns SHA-256 digest of a file, and its size, or (None, 0) if it doesn't exist."""
     if not os.path.exists(filepath):
-        return None
+        return None, 0
     hasher = hashlib.sha256()
+    size_in_bytes = 0
     try:
         with open(filepath, 'rb') as f:
             for chunk in iter(lambda: f.read(65536), b''):
                 hasher.update(chunk)
-        return hasher.hexdigest()
+                size_in_bytes += len(chunk)
+        return hasher.hexdigest(), size_in_bytes
     except Exception:
-        return None
+        return None, 0

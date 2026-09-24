@@ -5,7 +5,7 @@ description = "DSA-Optimized AI Knowledge Bank MCP Server"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp",
+    "mcp>=2,<3",
 ]
 
 [project.scripts]

@@ -2,13 +2,19 @@ from mcp.server.mcpserver import MCPServer
 from .core.storage import VaultStorage
 import os
 
+import sys
+
 # Initialize FastMCP server
 mcp = MCPServer("AgentVault")
 
 # Initialize storage
 # Using an environment variable or default local db
 db_path = os.environ.get("AGENT_VAULT_DB_PATH", "agent_vault.db")
-storage = VaultStorage(db_path)
+try:
+    storage = VaultStorage(db_path)
+except Exception as e:
+    print(f"Failed to initialize VaultStorage at {db_path}: {e}", file=sys.stderr)
+    sys.exit(1)
 
 @mcp.tool()
 def vault_store_memory(key: str, content: str, tags: str) -> str:
@@ -30,6 +36,7 @@ def vault_search(query: str, max_tokens: int = 2000) -> str:
         query: The search query.
         max_tokens: The maximum number of tokens to return to fit in context.
     """
+    max_tokens = max(50, max_tokens)
     results = storage.search_memory(query, max_tokens=max_tokens)
     if not results:
         return "No memories found matching the query."
@@ -50,6 +57,7 @@ def vault_cache_file(filepath: str, summary: str) -> str:
         filepath: Absolute path to the file.
         summary: The summary or AST of the file.
     """
+    filepath = os.path.relpath(filepath)
     success = storage.cache_file(filepath, summary)
     if success:
         return f"File '{filepath}' cached successfully."
@@ -64,6 +72,7 @@ def vault_check_file(filepath: str) -> str:
     Args:
         filepath: Absolute path to the file.
     """
+    filepath = os.path.relpath(filepath)
     result = storage.check_file(filepath)
     if result["cached"]:
         tokens_saved = result.get("tokens_saved", 0)
@@ -76,6 +85,19 @@ def vault_check_file(filepath: str) -> str:
 def vault_stats() -> str:
     """Get the Vault ROI Dashboard showing all-time tokens and time saved."""
     return storage.get_metrics_dashboard()
+
+@mcp.tool()
+def vault_delete_memory(key: str) -> str:
+    """Delete a memory from the vault by key."""
+    storage.delete_memory(key)
+    return f"Memory '{key}' deleted successfully."
+
+@mcp.tool()
+def vault_evict_file(filepath: str) -> str:
+    """Evict a file from the vault cache."""
+    filepath = os.path.relpath(filepath)
+    storage.evict_file(filepath)
+    return f"File '{filepath}' evicted successfully."
 
 def main():
     mcp.run()
