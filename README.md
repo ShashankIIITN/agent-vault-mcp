@@ -91,4 +91,19 @@ If you prefer a **"Global Brain"** that shares all memories and file caches acro
 - `vault_check_file(filepath)`: Verify a file's hash and return its cached summary + telemetry metrics.
 - `vault_stats()`: View the ROI dashboard of tokens and time saved.
 - `vault_delete_memory(key)`: Delete a stored memory.
-- `vault_evict_file(filepath)`: Evict a file from the vault cache.
+- `vault_evict_file(filepath)`: Evict a file from the vault cache.- `vault_cache_answer(prompt, response, dependencies, tags)`: Save an AI-generated answer linked to specific files and keywords.
+- `vault_search_questions(query, max_results)`: Keyword-search an FTS5 index to find exactly how previous cached questions were phrased based on tags.
+- `vault_search_answer(prompt)`: Retrieve a cached AI answer (automatically invalidates if dependent files have changed).
+
+## Semantic Prompt Caching (Intent Caching)
+
+In `v0.2.0`, Agent Vault introduced **Semantic Prompt Caching**. Instead of forcing AI agents to repeatedly read files and re-reason through complex architectural questions (e.g., *"How does the auth flow work?"*), agents can now cache their reasoning.
+
+### Dependency Invalidation
+To solve the classic LLM problem of "stale context hallucination," Agent Vault uses **Deterministic Dependency Invalidation**. When an agent caches an answer, it explicitly lists the files that answer depends on. 
+
+When a future agent asks the same question, the Vault calculates the real-time SHA-256 digest of those dependencies. If any file has changed, the cached answer is instantly evicted, forcing the AI to generate a fresh, accurate response.
+
+### N-to-1 Tag Mapping
+To solve the problem of "brittle exact matching" (where *"How does login work?"* misses a cache for *"How does the login work?"*), agents can assign **tags** to cached answers. 
+Agents can use `vault_search_questions("login")` to hit the FTS5 index, discover the exact phrasing of the cached question, and then fetch the answer—bypassing the need for heavy vector databases!
