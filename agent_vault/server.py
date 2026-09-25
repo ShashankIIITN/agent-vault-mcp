@@ -3,13 +3,16 @@ from .core.storage import VaultStorage
 import os
 
 import sys
+from typing import Union, List
 
 # Initialize FastMCP server
 mcp = MCPServer("AgentVault")
 
 # Initialize storage
 # Using an environment variable or default local db
-db_path = os.environ.get("AGENT_VAULT_DB_PATH", "agent_vault.db")
+default_db = os.path.expanduser("~/.local/share/agent-vault/vault.db")
+os.makedirs(os.path.dirname(default_db), exist_ok=True)
+db_path = os.environ.get("AGENT_VAULT_DB_PATH", default_db)
 try:
     storage = VaultStorage(db_path)
 except Exception as e:
@@ -57,7 +60,7 @@ def vault_cache_file(filepath: str, summary: str) -> str:
         filepath: Absolute path to the file.
         summary: The summary or AST of the file.
     """
-    filepath = os.path.relpath(filepath)
+    filepath = os.path.abspath(os.path.realpath(filepath))
     success = storage.cache_file(filepath, summary)
     if success:
         return f"File '{filepath}' cached successfully."
@@ -72,7 +75,7 @@ def vault_check_file(filepath: str) -> str:
     Args:
         filepath: Absolute path to the file.
     """
-    filepath = os.path.relpath(filepath)
+    filepath = os.path.abspath(os.path.realpath(filepath))
     result = storage.check_file(filepath)
     if result["cached"]:
         tokens_saved = result.get("tokens_saved", 0)
@@ -95,12 +98,16 @@ def vault_delete_memory(key: str) -> str:
 @mcp.tool()
 def vault_evict_file(filepath: str) -> str:
     """Evict a file from the vault cache."""
-    filepath = os.path.relpath(filepath)
+    filepath = os.path.abspath(os.path.realpath(filepath))
     storage.evict_file(filepath)
     return f"File '{filepath}' evicted successfully."
 
 @mcp.tool()
-def vault_cache_answer(prompt: str, response: str, dependencies: list[str], tags: str = "") -> str:
+def vault_cache_answer(prompt: str, response: str, dependencies: Union[str, List[str]], tags: Union[str, List[str]] = "") -> str:
+    if isinstance(dependencies, str):
+        dependencies = [d.strip() for d in dependencies.split(",") if d.strip()]
+    if isinstance(tags, list):
+        tags = ", ".join(tags)
     """Cache an AI response with its file dependencies and tags.
     
     Args:
