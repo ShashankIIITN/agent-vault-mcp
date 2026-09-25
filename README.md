@@ -64,11 +64,25 @@ To add this to an MCP client like Antigravity, add the following to your `mcp_co
 The Vault only saves tokens if the AI remembers to use it! Add this snippet to your project's `CLAUDE.md`, `.cursorrules`, or `GEMINI.md`:
 
 ```markdown
-# Memory & Context Rules
-You have access to the AgentVault MCP tools. You must manage your memory proactively to save tokens:
-1. **Before reading any file:** ALWAYS call `vault_check_file(filepath)` first. Only read the raw file if the vault misses.
-2. **After analyzing a file:** ALWAYS call `vault_cache_file(filepath, summary)` to save a concise AST/summary.
-3. **At the end of a complex task:** ALWAYS call `vault_store_memory` to log architectural decisions.
+# 🧠 Agent Vault & Memory Protocol
+You are equipped with the Agent Vault MCP Server. To protect the user's token limits and eliminate hallucination, you MUST strictly adhere to the following workflow:
+
+### 1. The "Think Before You Read" Rule (Semantic Cache)
+Before you spend time reading files to understand an architecture, flow, or system (e.g., "How does auth work?"):
+* **ALWAYS** call `vault_search_questions(query)` using keywords/tags to see if a previous agent already solved this.
+* If you find a match, call `vault_search_answer(prompt)` to retrieve the pre-computed answer instantly.
+
+### 2. The "Read Before You Write" Rule (File Cache)
+Before you execute commands to read raw code files:
+* **ALWAYS** call `vault_check_file(filepath)` first. 
+* If the Vault returns a Cache Hit, trust the summary/AST and DO NOT read the raw file unless you explicitly need to edit it.
+
+### 3. The "Leave It Better Than You Found It" Rule (Updating Cache)
+Your memory is only as good as what you save. After you complete a task:
+* **Cache Modified Files:** If you edited a file, ALWAYS call `vault_cache_file(filepath, summary)` to update its digest and AST.
+* **Cache New Knowledge:** If you just spent time analyzing a complex architecture or debugging a hard issue, ALWAYS call `vault_cache_answer(prompt, response, dependencies, tags)`.
+   * *Dependencies:* You MUST provide the exact file paths your answer relies on so the Vault can auto-invalidate your answer if those files change.
+   * *Tags:* Provide 5-6 broad keyword tags (e.g., "auth, login, jwt") so future agents can easily discover your answer via `vault_search_questions`.
 ```
 
 ## Local vs Global Vaults
@@ -106,4 +120,4 @@ When a future agent asks the same question, the Vault calculates the real-time S
 
 ### N-to-1 Tag Mapping
 To solve the problem of "brittle exact matching" (where *"How does login work?"* misses a cache for *"How does the login work?"*), agents can assign **tags** to cached answers. 
-Agents can use `vault_search_questions("login")` to hit the FTS5 index, discover the exact phrasing of the cached question, and then fetch the answer�bypassing the need for heavy vector databases!
+Agents can use `vault_search_questions("login")` to hit the FTS5 index, discover the exact phrasing of the cached question, and then fetch the answer—bypassing the need for heavy vector databases!
