@@ -100,16 +100,28 @@ def vault_evict_file(filepath: str) -> str:
     return f"File '{filepath}' evicted successfully."
 
 @mcp.tool()
-def vault_cache_answer(prompt: str, response: str, dependencies: list[str]) -> str:
-    """Cache an AI response with its file dependencies.
+def vault_cache_answer(prompt: str, response: str, dependencies: list[str], tags: str = "") -> str:
+    """Cache an AI response with its file dependencies and tags.
     
     Args:
-        prompt: The user's prompt.
+        prompt: The exact prompt/question.
         response: The AI's generated response.
         dependencies: A list of absolute or relative file paths this response depends on.
+        tags: Comma separated tags (e.g. 'auth, login, jwt') to help future agents find this prompt.
     """
-    storage.cache_answer(prompt, response, dependencies)
+    storage.cache_answer(prompt, response, dependencies, tags)
     return "Answer cached successfully."
+
+@mcp.tool()
+def vault_search_questions(query: str, max_results: int = 5) -> str:
+    """Discover cached questions using a keyword search.
+    Returns a list of exact cached prompts. Once you find a match, use vault_search_answer with the exact prompt.
+    
+    Args:
+        query: The semantic intent or keywords (e.g., 'auth login flow').
+        max_results: Max number of question options to return.
+    """
+    return storage.search_questions(query, max_results)
 
 @mcp.tool()
 def vault_search_answer(prompt: str) -> str:
