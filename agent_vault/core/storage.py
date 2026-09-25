@@ -66,6 +66,31 @@ class VaultStorage:
                 )
             ''')
             
+
+            self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS prompt_cache (
+                    id INTEGER PRIMARY KEY,
+                    query_hash TEXT UNIQUE,
+                    prompt TEXT,
+                    response TEXT,
+                    dependency_files TEXT,
+                    tags TEXT
+                )
+            ''')
+            # Handle migration
+            cursor = self.conn.execute("PRAGMA table_info(prompt_cache)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'prompt' not in columns:
+                self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN prompt TEXT')
+            if 'tags' not in columns:
+                self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN tags TEXT')
+                
+            self.conn.execute('''
+                CREATE VIRTUAL TABLE IF NOT EXISTS prompt_search USING fts5(
+                    prompt, tags, query_hash UNINDEXED
+                )
+            ''')
+
         # Hydrate bloom filter with existing files
         try:
             cursor = self.conn.execute("SELECT filepath FROM file_cache")
@@ -225,18 +250,56 @@ class VaultStorage:
             f"==========================="
         )
 
-    def cache_answer(self, prompt, response, dependencies):
+    def cache_answer(self, prompt, response, dependencies, tags=""):
         import hashlib
         import json
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
         deps_json = json.dumps([os.path.relpath(d) for d in dependencies])
         with self.conn:
             self.conn.execute("DELETE FROM prompt_cache WHERE query_hash = ?", (query_hash,))
+            self.conn.execute("DELETE FROM prompt_search WHERE query_hash = ?", (query_hash,))
             self.conn.execute('''
-                INSERT INTO prompt_cache (query_hash, response, dependency_files)
+                INSERT INTO prompt_cache (query_hash, prompt, response, dependency_files, tags)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (query_hash, prompt, response, deps_json, tags))
+            self.conn.execute('''
+                INSERT INTO prompt_search (prompt, tags, query_hash)
                 VALUES (?, ?, ?)
-            ''', (query_hash, response, deps_json))
+            ''', (prompt, tags, query_hash))
         return True
+        
+    def search_questions(self, query, max_results=5):
+        # Sanitize query
+        safe_query = ''.join(c if c.isalnum() or c.isspace() else ' ' for c in query).strip()
+        if not safe_query:
+            return "No valid search terms provided."
+        
+        # Prepare FTS exact match string format: "word1" "word2"
+        fts_query = ' '.join(f'"{word}"' for word in safe_query.split())
+            
+        try:
+            cursor = self.conn.execute('''
+                SELECT prompt, tags, rank 
+                FROM prompt_search 
+                WHERE prompt_search MATCH ? 
+                ORDER BY rank LIMIT ?
+            ''', (fts_query, max_results))
+        except Exception as e:
+            return f"Search failed: {e}"
+            
+        rows = cursor.fetchall()
+        if not rows:
+            return "No matching questions found in the cache."
+            
+        out = [f"Found {len(rows)} matching cached questions:"]
+        for i, (p, t, r) in enumerate(rows, 1):
+            out.append(f"--- Option {i} ---")
+            out.append(f"Prompt: {p}")
+            out.append(f"Tags: {t if t else 'None'}")
+            out.append("")
+        out.append("Use vault_search_answer with the exact Prompt string if one matches your intent.")
+        return "\n".join(out)
+
 
     def search_answer(self, prompt):
         import hashlib
