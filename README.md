@@ -25,40 +25,44 @@ When the agent wants to check a file, the Vault hashes it (SHA-256). If it hasn'
 
 ## Installation
 
-### Option 1: Global Python (3.10+)
-```bash
-# Clone or navigate to the repository
-cd agent-vault-mcp
+Agent Vault is officially published on [PyPI](https://pypi.org/project/agent-vault-mcp/)! 
 
-# Install the package
-pip install -e .
-```
+You can install it globally via `pip` or use it instantly without installation via `uvx`.
 
-### Option 2: Using `uv` (Virtual Environment)
-```bash
-uv venv --python 3.12
-.venv\Scripts\activate  # On Windows
-uv pip install -e .
-```
+### Option 1: Zero-Install (Recommended)
+If you have `uv` installed, you do not need to install this package on your system. You can run it dynamically.
 
-## How to use with Antigravity / Claude Code
-
-To add this to an MCP client like Antigravity, add the following to your `mcp_config.json` (e.g., `~/.gemini/config/mcp_config.json`):
+Add the following to your `mcp_config.json` (e.g., `~/.gemini/config/mcp_config.json` for Antigravity, or Claude Desktop config):
 
 ```json
 {
   "mcpServers": {
     "agent-vault": {
-      "command": "python",
-      "args": ["-m", "agent_vault.server"],
-      "env": {
-        "PYTHONPATH": "/absolute/path/to/agent-vault-mcp"
-      }
+      "command": "uvx",
+      "args": ["agent-vault-mcp"]
     }
   }
 }
 ```
-*Note: If you used a virtual environment, change `"command": "python"` to the absolute path of the python executable inside `.venv`.*
+
+### Option 2: Global `pip` Installation
+If you prefer a traditional global installation:
+
+```bash
+pip install agent-vault-mcp
+```
+
+Then configure your MCP client:
+```json
+{
+  "mcpServers": {
+    "agent-vault": {
+      "command": "python",
+      "args": ["-m", "agent_vault.server"]
+    }
+  }
+}
+```
 
 ### Adoption (Forcing the AI to use it)
 The Vault only saves tokens if the AI remembers to use it! Add this snippet to your project's `CLAUDE.md`, `.cursorrules`, or `GEMINI.md`:
