@@ -16,7 +16,6 @@ When the agent wants to check a file, the Vault hashes it (SHA-256). If it hasn'
 - **Token-Bounded MinHeap**: Ranks the best context snippets and strictly cuts off when the maximum token limit is reached, protecting the context window.
 - **SQLite FTS5 (BM25)**: Fast lexical and semantic search for symbols, errors, and flows.
 - **ROI Telemetry**: Natively calculates and tracks how many tokens and hours of inference time are saved by skipping raw file reads.
-- **100% Portable**: Caches are stored using relative paths, meaning you can move or rename your project folder without breaking the vault.
 
 ## Dependencies
 - Python 3.10+
@@ -89,19 +88,6 @@ Your memory is only as good as what you save. After you complete a task:
    * *Tags:* Provide 5-6 broad keyword tags (e.g., "auth, login, jwt") so future agents can easily discover your answer via `vault_search_questions`.
 ```
 
-## Local vs Global Vaults
-
-By default, the MCP server creates `agent_vault.db` inside your current active project workspace. Paths are stored **relatively**. This means if you ask the agent about a file in an external project (e.g., `../Project_B/main.py`), that cross-project memory is stored locally inside your current project's database.
-
-If you prefer a **"Global Brain"** that shares all memories and file caches across every single project on your computer, simply add `AGENT_VAULT_DB_PATH` to the `env` variables in your `mcp_config.json`:
-
-```json
-"env": {
-  "PYTHONPATH": "/absolute/path/to/agent-vault-mcp",
-  "AGENT_VAULT_DB_PATH": "/absolute/path/to/.global_agent_vault.db"
-}
-```
-
 ## Available MCP Tools
 - `vault_store_memory(key, content, tags)`: Save arbitrary architectural notes or debugging insights.
 - `vault_search(query, max_tokens)`: Search the vault using BM25 ranking.
@@ -125,3 +111,24 @@ When a future agent asks the same question, the Vault calculates the real-time S
 ### N-to-1 Tag Mapping
 To solve the problem of "brittle exact matching" (where *"How does login work?"* misses a cache for *"How does the login work?"*), agents can assign **tags** to cached answers. 
 Agents can use `vault_search_questions("login")` to hit the FTS5 index, discover the exact phrasing of the cached question, and then fetch the answer—bypassing the need for heavy vector databases!
+
+## Global vs. Portable Mode
+
+By default, Agent Vault operates as a **Global Machine Brain**. It uses absolute paths and stores a single global SQLite database at `~/.local/share/agent-vault/vault.db`. This allows it to seamlessly memorize context across all projects on your computer.
+
+If you want a **Portable Brain** for a specific repository (e.g., to commit `.agent_vault.db` to Git and share pre-warmed context with your team), you can define the project root in your MCP environment variables:
+
+```json
+{
+  "mcpServers": {
+    "agent-vault": {
+      "command": "uvx",
+      "args": ["agent-vault-mcp"],
+      "env": {
+        "AGENT_VAULT_PROJECT_ROOT": "/absolute/path/to/your/repo"
+      }
+    }
+  }
+}
+```
+When `AGENT_VAULT_PROJECT_ROOT` is set, the Vault will initialize the database locally inside that folder and strictly use relative paths to ensure cross-platform compatibility across Mac, Linux, and Windows.

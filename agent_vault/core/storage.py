@@ -16,6 +16,23 @@ class VaultStorage:
         self.bloom_filter = BloomFilter()
         self._init_db()
 
+    
+    def _to_os_path(self, db_path):
+        import os
+        if self.project_root and not os.path.isabs(db_path):
+            return os.path.join(self.project_root, db_path)
+        return db_path
+        
+    def _to_db_path(self, filepath):
+        import os
+        abs_path = os.path.abspath(os.path.realpath(filepath))
+        if self.project_root:
+            try:
+                return os.path.relpath(abs_path, start=self.project_root).replace(os.sep, '/')
+            except ValueError:
+                pass
+        return abs_path
+
     def _init_db(self):
         with self.conn:
             # FTS5 table for memory snippets
@@ -252,10 +269,11 @@ class VaultStorage:
         
         deps_data = {}
         for d in dependencies:
-            path = os.path.abspath(os.path.realpath(d))
-            if os.path.exists(path):
-                digest, _ = get_file_digest(path)
-                deps_data[path] = digest
+            db_path = self._to_db_path(d)
+            os_path = self._to_os_path(db_path)
+            if os.path.exists(os_path):
+                digest, _ = get_file_digest(os_path)
+                deps_data[db_path] = digest
                 
         deps_json = json.dumps(deps_data)
         with self.conn:
