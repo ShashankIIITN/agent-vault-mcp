@@ -16,7 +16,6 @@ When the agent wants to check a file, the Vault hashes it (SHA-256). If it hasn'
 - **Token-Bounded MinHeap**: Ranks the best context snippets and strictly cuts off when the maximum token limit is reached, protecting the context window.
 - **SQLite FTS5 (BM25)**: Fast lexical and semantic search for symbols, errors, and flows.
 - **ROI Telemetry**: Natively calculates and tracks how many tokens and hours of inference time are saved by skipping raw file reads.
-- **100% Portable**: Caches are stored using relative paths, meaning you can move or rename your project folder without breaking the vault.
 
 ## Dependencies
 - Python 3.10+
@@ -87,19 +86,6 @@ Your memory is only as good as what you save. After you complete a task:
 * **Cache New Knowledge:** If you just spent time analyzing a complex architecture or debugging a hard issue, ALWAYS call `vault_cache_answer(prompt, response, dependencies, tags)`.
    * *Dependencies:* You MUST provide the exact file paths your answer relies on so the Vault can auto-invalidate your answer if those files change.
    * *Tags:* Provide 5-6 broad keyword tags (e.g., "auth, login, jwt") so future agents can easily discover your answer via `vault_search_questions`.
-```
-
-## Local vs Global Vaults
-
-By default, the MCP server creates `agent_vault.db` inside your current active project workspace. Paths are stored **relatively**. This means if you ask the agent about a file in an external project (e.g., `../Project_B/main.py`), that cross-project memory is stored locally inside your current project's database.
-
-If you prefer a **"Global Brain"** that shares all memories and file caches across every single project on your computer, simply add `AGENT_VAULT_DB_PATH` to the `env` variables in your `mcp_config.json`:
-
-```json
-"env": {
-  "PYTHONPATH": "/absolute/path/to/agent-vault-mcp",
-  "AGENT_VAULT_DB_PATH": "/absolute/path/to/.global_agent_vault.db"
-}
 ```
 
 ## Available MCP Tools
