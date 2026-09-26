@@ -8,13 +8,28 @@ from typing import Union, List
 # Initialize FastMCP server
 mcp = MCPServer("AgentVault")
 
+def normalize_path(filepath: str) -> str:
+    abs_path = os.path.abspath(os.path.realpath(filepath))
+    if PROJECT_ROOT:
+        try:
+            return os.path.relpath(abs_path, start=PROJECT_ROOT).replace(os.sep, '/')
+        except ValueError:
+            pass
+    return abs_path
+
+
 # Initialize storage
 # Using an environment variable or default local db
-default_db = os.path.expanduser("~/.local/share/agent-vault/vault.db")
-os.makedirs(os.path.dirname(default_db), exist_ok=True)
+PROJECT_ROOT = os.environ.get("AGENT_VAULT_PROJECT_ROOT")
+if PROJECT_ROOT:
+    default_db = os.path.join(PROJECT_ROOT, ".agent_vault.db")
+else:
+    default_db = os.path.expanduser("~/.local/share/agent-vault/vault.db")
+    os.makedirs(os.path.dirname(default_db), exist_ok=True)
+
 db_path = os.environ.get("AGENT_VAULT_DB_PATH", default_db)
 try:
-    storage = VaultStorage(db_path)
+    storage = VaultStorage(db_path, project_root=PROJECT_ROOT)
 except Exception as e:
     print(f"Failed to initialize VaultStorage at {db_path}: {e}", file=sys.stderr)
     sys.exit(1)
@@ -60,7 +75,7 @@ def vault_cache_file(filepath: str, summary: str) -> str:
         filepath: Absolute path to the file.
         summary: The summary or AST of the file.
     """
-    filepath = os.path.abspath(os.path.realpath(filepath))
+    filepath = normalize_path(filepath)
     success = storage.cache_file(filepath, summary)
     if success:
         return f"File '{filepath}' cached successfully."
@@ -75,7 +90,7 @@ def vault_check_file(filepath: str) -> str:
     Args:
         filepath: Absolute path to the file.
     """
-    filepath = os.path.abspath(os.path.realpath(filepath))
+    filepath = normalize_path(filepath)
     result = storage.check_file(filepath)
     if result["cached"]:
         tokens_saved = result.get("tokens_saved", 0)
@@ -98,7 +113,7 @@ def vault_delete_memory(key: str) -> str:
 @mcp.tool()
 def vault_evict_file(filepath: str) -> str:
     """Evict a file from the vault cache."""
-    filepath = os.path.abspath(os.path.realpath(filepath))
+    filepath = normalize_path(filepath)
     storage.evict_file(filepath)
     return f"File '{filepath}' evicted successfully."
 
