@@ -125,3 +125,24 @@ When a future agent asks the same question, the Vault calculates the real-time S
 ### N-to-1 Tag Mapping
 To solve the problem of "brittle exact matching" (where *"How does login work?"* misses a cache for *"How does the login work?"*), agents can assign **tags** to cached answers. 
 Agents can use `vault_search_questions("login")` to hit the FTS5 index, discover the exact phrasing of the cached question, and then fetch the answer—bypassing the need for heavy vector databases!
+
+## Global vs. Portable Mode
+
+By default, Agent Vault operates as a **Global Machine Brain**. It uses absolute paths and stores a single global SQLite database at `~/.local/share/agent-vault/vault.db`. This allows it to seamlessly memorize context across all projects on your computer.
+
+If you want a **Portable Brain** for a specific repository (e.g., to commit `.agent_vault.db` to Git and share pre-warmed context with your team), you can define the project root in your MCP environment variables:
+
+```json
+{
+  "mcpServers": {
+    "agent-vault": {
+      "command": "uvx",
+      "args": ["agent-vault-mcp"],
+      "env": {
+        "AGENT_VAULT_PROJECT_ROOT": "/absolute/path/to/your/repo"
+      }
+    }
+  }
+}
+```
+When `AGENT_VAULT_PROJECT_ROOT` is set, the Vault will initialize the database locally inside that folder and strictly use relative paths to ensure cross-platform compatibility across Mac, Linux, and Windows.
