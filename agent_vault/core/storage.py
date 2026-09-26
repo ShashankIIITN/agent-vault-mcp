@@ -57,14 +57,6 @@ class VaultStorage:
                 self.conn.execute('ALTER TABLE metrics ADD COLUMN reason TEXT')
 
             # Prompt cache table
-            self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS prompt_cache (
-                    id INTEGER PRIMARY KEY,
-                    query_hash TEXT UNIQUE,
-                    response TEXT,
-                    dependency_files TEXT
-                )
-            ''')
             
 
             self.conn.execute('''
@@ -253,8 +245,19 @@ class VaultStorage:
     def cache_answer(self, prompt, response, dependencies, tags=""):
         import hashlib
         import json
+        import os
+        from .dsa import get_file_digest
+        
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
-        deps_json = json.dumps([os.path.relpath(d) for d in dependencies])
+        
+        deps_data = {}
+        for d in dependencies:
+            path = os.path.abspath(os.path.realpath(d))
+            if os.path.exists(path):
+                digest, _ = get_file_digest(path)
+                deps_data[path] = digest
+                
+        deps_json = json.dumps(deps_data)
         with self.conn:
             self.conn.execute("DELETE FROM prompt_cache WHERE query_hash = ?", (query_hash,))
             self.conn.execute("DELETE FROM prompt_search WHERE query_hash = ?", (query_hash,))
@@ -275,7 +278,7 @@ class VaultStorage:
             return "No valid search terms provided."
         
         # Prepare FTS exact match string format: "word1" "word2"
-        fts_query = ' '.join(f'"{word}"' for word in safe_query.split())
+        fts_query = ' OR '.join(f'"{word}"*' for word in safe_query.split())
             
         try:
             cursor = self.conn.execute('''
