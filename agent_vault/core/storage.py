@@ -4,8 +4,9 @@ import json
 from .dsa import BloomFilter, get_file_digest, TokenBoundedMinHeap
 
 class VaultStorage:
-    def __init__(self, db_path="vault.db"):
+    def __init__(self, db_path="vault.db", project_root=None):
         self.db_path = db_path
+        self.project_root = project_root
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         try:
             os.chmod(self.db_path, 0o600)
@@ -130,13 +131,20 @@ class VaultStorage:
         if not safe_query:
             return []
             
+        
+        # Split into words and create an OR query with wildcards for better natural language matching
+        words = [w for w in safe_query.split() if len(w) > 2]
+        if not words:
+            return []
+            
+        fts_query = ' OR '.join(f'"{w}"*' for w in words)
         try:
             cursor = self.conn.execute('''
                 SELECT key, content, tags, tokens, rank 
                 FROM memories 
                 WHERE memories MATCH ? 
                 ORDER BY rank
-            ''', (safe_query,))
+            ''', (fts_query,))
         except sqlite3.OperationalError:
             # fallback if query is still invalid
             return []
@@ -179,7 +187,8 @@ class VaultStorage:
             self.conn.execute("DELETE FROM file_cache WHERE filepath = ?", (filepath,))
 
     def cache_file(self, filepath, summary):
-        digest, raw_file_size = get_file_digest(filepath)
+        os_path = self._to_os_path(filepath)
+        digest, raw_file_size = get_file_digest(os_path)
         if not digest:
             return False
             
@@ -208,7 +217,8 @@ class VaultStorage:
             return {"cached": False, "reason": "Not in bloom filter"}
             
         # 2. Check digest
-        current_digest, _ = get_file_digest(filepath)
+        os_path = self._to_os_path(filepath)
+        current_digest, _ = get_file_digest(os_path)
         if not current_digest:
              with self.conn:
                  self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "not_found"))
@@ -325,6 +335,9 @@ class VaultStorage:
     def search_answer(self, prompt):
         import hashlib
         import json
+        import os
+        from .dsa import get_file_digest
+        
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
         
         cursor = self.conn.execute(
@@ -335,23 +348,35 @@ class VaultStorage:
         
         for row in rows:
             row_id, response, deps_json = row
-            dependencies = json.loads(deps_json)
+            deps_data = json.loads(deps_json)
             
             is_valid = True
-            for filepath in dependencies:
-                # Get current digest from disk
-                current_digest, _ = get_file_digest(filepath)
-                if not current_digest:
-                    is_valid = False
-                    break
+            if isinstance(deps_data, list):
+                # Backwards compatibility: deps_data is a list of filepaths
+                for filepath in deps_data:
+                    os_path = self._to_os_path(filepath)
+                    current_digest, _ = get_file_digest(os_path)
+                    if not current_digest:
+                        is_valid = False
+                        break
+                        
+                    c = self.conn.execute("SELECT digest FROM file_cache WHERE filepath = ?", (filepath,))
+                    cached_row = c.fetchone()
                     
-                # Get cached digest from file_cache
-                c = self.conn.execute("SELECT digest FROM file_cache WHERE filepath = ?", (filepath,))
-                cached_row = c.fetchone()
-                
-                if not cached_row or cached_row[0] != current_digest:
-                    is_valid = False
-                    break
+                    if not cached_row or cached_row[0] != current_digest:
+                        is_valid = False
+                        break
+            else:
+                # New logic: deps_data is a dict of {filepath: hash}
+                for filepath, saved_hash in deps_data.items():
+                    os_path = self._to_os_path(filepath)
+                    if not os.path.exists(os_path):
+                        is_valid = False
+                        break
+                    current_digest, _ = get_file_digest(os_path)
+                    if current_digest != saved_hash:
+                        is_valid = False
+                        break
                     
             if is_valid:
                 return response
