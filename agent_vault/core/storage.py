@@ -80,7 +80,8 @@ class VaultStorage:
             self.conn.execute('''
                 CREATE TABLE IF NOT EXISTS prompt_cache (
                     id INTEGER PRIMARY KEY,
-                    query_hash TEXT UNIQUE,
+                    query_hash TEXT,
+                    context_dir TEXT,
                     prompt TEXT,
                     response TEXT,
                     dependency_files TEXT,
@@ -90,9 +91,30 @@ class VaultStorage:
             # Handle migration
             cursor = self.conn.execute("PRAGMA table_info(prompt_cache)")
             columns = [col[1] for col in cursor.fetchall()]
-            if 'prompt' not in columns:
+            if 'context_dir' not in columns:
+                # We need to drop the UNIQUE constraint on query_hash, which requires table recreation in SQLite.
+                # Since it's just a cache, we can safely drop and recreate.
+                self.conn.execute('DROP TABLE prompt_cache')
+                self.conn.execute('DROP TABLE IF EXISTS prompt_search')
+                self.conn.execute('''
+                    CREATE TABLE prompt_cache (
+                        id INTEGER PRIMARY KEY,
+                        query_hash TEXT,
+                        context_dir TEXT,
+                        prompt TEXT,
+                        response TEXT,
+                        dependency_files TEXT,
+                        tags TEXT
+                    )
+                ''')
+                self.conn.execute('''
+                    CREATE VIRTUAL TABLE prompt_search USING fts5(
+                        prompt, tags, query_hash UNINDEXED
+                    )
+                ''')
+            elif 'prompt' not in columns:
                 self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN prompt TEXT')
-            if 'tags' not in columns:
+            elif 'tags' not in columns:
                 self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN tags TEXT')
                 
             self.conn.execute('''
@@ -287,12 +309,13 @@ class VaultStorage:
                 
         deps_json = json.dumps(deps_data)
         with self.conn:
-            self.conn.execute("DELETE FROM prompt_cache WHERE query_hash = ?", (query_hash,))
-            self.conn.execute("DELETE FROM prompt_search WHERE query_hash = ?", (query_hash,))
+            context_dir = self.project_root or os.getcwd()
+            # Delete old entry for this specific context to update
+            self.conn.execute("DELETE FROM prompt_cache WHERE query_hash = ? AND context_dir = ?", (query_hash, context_dir))
             self.conn.execute('''
-                INSERT INTO prompt_cache (query_hash, prompt, response, dependency_files, tags)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (query_hash, prompt, response, deps_json, tags))
+                INSERT INTO prompt_cache (query_hash, context_dir, prompt, response, dependency_files, tags)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (query_hash, context_dir, prompt, response, deps_json, tags))
             self.conn.execute('''
                 INSERT INTO prompt_search (prompt, tags, query_hash)
                 VALUES (?, ?, ?)
@@ -340,9 +363,10 @@ class VaultStorage:
         
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
         
+        context_dir = self.project_root or os.getcwd()
         cursor = self.conn.execute(
-            "SELECT id, response, dependency_files FROM prompt_cache WHERE query_hash = ?", 
-            (query_hash,)
+            "SELECT id, response, dependency_files FROM prompt_cache WHERE query_hash = ? AND (context_dir = ? OR context_dir IS NULL)", 
+            (query_hash, context_dir)
         )
         rows = cursor.fetchall()
         
