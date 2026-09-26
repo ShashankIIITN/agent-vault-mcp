@@ -9,4 +9,5 @@ dependencies = [
 ]
 
 [project.scripts]
+agent-vault-mcp = "agent_vault.server:main"
 agent-vault = "agent_vault.server:main"

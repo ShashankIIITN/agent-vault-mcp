@@ -38,7 +38,7 @@ Add the following to your `mcp_config.json` (e.g., `~/.gemini/config/mcp_config.
   "mcpServers": {
     "agent-vault": {
       "command": "uvx",
-      "args": ["agent-vault-mcp"]
+      "args": ["--from", "agent-vault-mcp", "agent-vault-mcp"]
     }
   }
 }
@@ -123,7 +123,7 @@ If you want a **Portable Brain** for a specific repository (e.g., to commit `.ag
   "mcpServers": {
     "agent-vault": {
       "command": "uvx",
-      "args": ["agent-vault-mcp"],
+      "args": ["--from", "agent-vault-mcp", "agent-vault-mcp"],
       "env": {
         "AGENT_VAULT_PROJECT_ROOT": "/absolute/path/to/your/repo"
       }
