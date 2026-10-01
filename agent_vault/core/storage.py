@@ -85,7 +85,8 @@ class VaultStorage:
                     prompt TEXT,
                     response TEXT,
                     dependency_files TEXT,
-                    tags TEXT
+                    tags TEXT,
+                    tokens_saved_per_hit INTEGER DEFAULT 0
                 )
             ''')
             # Handle migration
@@ -116,6 +117,8 @@ class VaultStorage:
                 self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN prompt TEXT')
             elif 'tags' not in columns:
                 self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN tags TEXT')
+            if 'tokens_saved_per_hit' not in columns:
+                self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN tokens_saved_per_hit INTEGER DEFAULT 0')
                 
             self.conn.execute('''
                 CREATE VIRTUAL TABLE IF NOT EXISTS prompt_search USING fts5(
@@ -300,22 +303,26 @@ class VaultStorage:
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
         
         deps_data = {}
+        total_dependency_size = 0
         for d in dependencies:
             db_path = self._to_db_path(d)
             os_path = self._to_os_path(db_path)
             if os.path.exists(os_path):
-                digest, _ = get_file_digest(os_path)
+                digest, raw_size = get_file_digest(os_path)
                 deps_data[db_path] = digest
+                total_dependency_size += raw_size
                 
+        tokens_saved_per_hit = max(0, (total_dependency_size // 4) - (len(response) // 4))
         deps_json = json.dumps(deps_data)
+        
         with self.conn:
             context_dir = self.project_root or os.getcwd()
             # Delete old entry for this specific context to update
             self.conn.execute("DELETE FROM prompt_cache WHERE query_hash = ? AND context_dir = ?", (query_hash, context_dir))
             self.conn.execute('''
-                INSERT INTO prompt_cache (query_hash, context_dir, prompt, response, dependency_files, tags)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (query_hash, context_dir, prompt, response, deps_json, tags))
+                INSERT INTO prompt_cache (query_hash, context_dir, prompt, response, dependency_files, tags, tokens_saved_per_hit)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (query_hash, context_dir, prompt, response, deps_json, tags, tokens_saved_per_hit))
             self.conn.execute('''
                 INSERT INTO prompt_search (prompt, tags, query_hash)
                 VALUES (?, ?, ?)
@@ -365,13 +372,13 @@ class VaultStorage:
         
         context_dir = self.project_root or os.getcwd()
         cursor = self.conn.execute(
-            "SELECT id, response, dependency_files FROM prompt_cache WHERE query_hash = ? AND (context_dir = ? OR context_dir IS NULL)", 
+            "SELECT id, response, dependency_files, tokens_saved_per_hit FROM prompt_cache WHERE query_hash = ? AND (context_dir = ? OR context_dir IS NULL)", 
             (query_hash, context_dir)
         )
         rows = cursor.fetchall()
         
         for row in rows:
-            row_id, response, deps_json = row
+            row_id, response, deps_json, tokens_saved_per_hit = row
             deps_data = json.loads(deps_json)
             
             is_valid = True
@@ -403,6 +410,13 @@ class VaultStorage:
                         break
                     
             if is_valid:
+                # Log metrics for semantic cache hit
+                tokens_saved = tokens_saved_per_hit if tokens_saved_per_hit is not None else 0
+                with self.conn:
+                    self.conn.execute('''
+                        INSERT INTO metrics (filepath, is_hit, tokens_saved, reason)
+                        VALUES (?, 1, ?, ?)
+                    ''', ("semantic_cache", tokens_saved, "Semantic cache hit"))
                 return response
             else:
                 # Evict stale cache entry
