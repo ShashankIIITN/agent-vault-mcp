@@ -211,7 +211,55 @@ class VaultStorage:
         with self.conn:
             self.conn.execute("DELETE FROM file_cache WHERE filepath = ?", (filepath,))
 
+    def _is_ignored(self, filepath):
+        import subprocess
+        import os
+        try:
+            os_path = self._to_os_path(filepath)
+            cwd = self.project_root or os.path.dirname(os_path) or os.getcwd()
+            result = subprocess.run(
+                ['git', 'check-ignore', '-q', os_path],
+                cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+
+    def cache_resource(self, uri, version_hash, summary):
+        with self.conn:
+            self.conn.execute('''
+                INSERT INTO file_cache (filepath, digest, summary, tokens_saved_per_hit)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(filepath) DO UPDATE SET
+                    digest=excluded.digest,
+                    summary=excluded.summary,
+                    tokens_saved_per_hit=excluded.tokens_saved_per_hit
+            ''', (uri, version_hash, summary, 500))
+        return True
+
+    def check_resource(self, uri, version_hash):
+        cursor = self.conn.execute("SELECT digest, summary, tokens_saved_per_hit FROM file_cache WHERE filepath = ?", (uri,))
+        row = cursor.fetchone()
+        
+        if not row:
+            with self.conn:
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (uri, "resource_not_in_db"))
+            return {"cached": False, "reason": "not_in_db"}
+            
+        cached_digest, summary, tokens_saved = row
+        if version_hash == cached_digest:
+            with self.conn:
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 1, ?, ?)", (uri, tokens_saved, "resource_hit"))
+            return {"cached": True, "summary": summary}
+        else:
+            with self.conn:
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (uri, "resource_mismatch"))
+            return {"cached": False, "reason": "version_hash mismatch"}
+
     def cache_file(self, filepath, summary):
+        if self._is_ignored(filepath):
+            return False
         os_path = self._to_os_path(filepath)
         digest, raw_file_size = get_file_digest(os_path)
         if not digest:
@@ -305,6 +353,10 @@ class VaultStorage:
         deps_data = {}
         total_dependency_size = 0
         for d in dependencies:
+            if isinstance(d, dict) and "uri" in d and "version_hash" in d:
+                deps_data[d["uri"]] = d["version_hash"]
+                continue
+            
             db_path = self._to_db_path(d)
             os_path = self._to_os_path(db_path)
             if os.path.exists(os_path):
@@ -382,6 +434,7 @@ class VaultStorage:
             deps_data = json.loads(deps_json)
             
             is_valid = True
+            unvalidated_deps = {}
             if isinstance(deps_data, list):
                 # Backwards compatibility: deps_data is a list of filepaths
                 for filepath in deps_data:
@@ -400,6 +453,11 @@ class VaultStorage:
             else:
                 # New logic: deps_data is a dict of {filepath: hash}
                 for filepath, saved_hash in deps_data.items():
+                    if "://" in filepath:
+                        # External dependency, skip local hashing
+                        unvalidated_deps[filepath] = saved_hash
+                        continue
+                        
                     os_path = self._to_os_path(filepath)
                     if not os.path.exists(os_path):
                         is_valid = False
@@ -417,7 +475,7 @@ class VaultStorage:
                         INSERT INTO metrics (filepath, is_hit, tokens_saved, reason)
                         VALUES (?, 1, ?, ?)
                     ''', ("semantic_cache", tokens_saved, "Semantic cache hit"))
-                return response
+                return {"response": response, "unvalidated_dependencies": unvalidated_deps}
             else:
                 # Evict stale cache entry
                 with self.conn:
