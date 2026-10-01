@@ -81,7 +81,14 @@ Before you execute commands to read raw code files:
 * **ALWAYS** call `vault_check_file(filepath)` first. 
 * If the Vault returns a Cache Hit, trust the summary/AST and DO NOT read the raw file.
 
-### 3. External Dependencies & Git Context
+### 3. The "Leave It Better Than You Found It" Rule (Updating Cache)
+Your memory is only as good as what you save. After you complete a task:
+* **Cache Modified Files:** If you edited a file, ALWAYS call `vault_cache_file(filepath, summary)` to update its digest and AST.
+* **Cache New Knowledge:** If you just spent time analyzing a complex architecture or debugging a hard issue, ALWAYS call `vault_cache_answer(prompt, response, dependencies, tags)`.
+   * *Dependencies:* You MUST provide the exact file paths your answer relies on so the Vault can auto-invalidate your answer if those files change.
+   * *Tags:* Provide 5-6 broad keyword tags (e.g., "auth, login, jwt") so future agents can easily discover your answer via `vault_search_questions`.
+
+### 4. External Dependencies & Git Context
 * **Notion/GitHub Docs:** Use `vault_cache_resource` to cache summaries of external links (pass the URI and `last_edited_time` as the version hash). 
 * **Diff Checking:** When a user asks you to fix uncommitted code, immediately run `vault_check_diff()` to see the Vault's summaries of the modified files *before* the user broke them.
 ```
