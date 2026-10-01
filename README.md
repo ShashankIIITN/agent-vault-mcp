@@ -16,6 +16,7 @@ When the agent wants to check a file, the Vault hashes it (SHA-256). If it hasn'
 - **Token-Bounded MinHeap**: Ranks the best context snippets and strictly cuts off when the maximum token limit is reached, protecting the context window.
 - **SQLite FTS5 (BM25)**: Fast lexical and semantic search for symbols, errors, and flows.
 - **ROI Telemetry**: Natively calculates and tracks how many tokens and hours of inference time are saved by skipping raw file reads.
+- **Git-Aware Context (v1.2.0)**: Natively parses `.gitignore` to protect your database from bloat, and provides instant diff context.
 
 ## Dependencies
 - Python 3.10+
@@ -67,25 +68,22 @@ Then configure your MCP client:
 The Vault only saves tokens if the AI remembers to use it! Add this snippet to your project's `CLAUDE.md`, `.cursorrules`, or `GEMINI.md`:
 
 ```markdown
-# 🧠 Agent Vault & Memory Protocol
+# Agent Vault & Memory Protocol
 You are equipped with the Agent Vault MCP Server. To protect the user's token limits and eliminate hallucination, you MUST strictly adhere to the following workflow:
 
 ### 1. The "Think Before You Read" Rule (Semantic Cache)
-Before you spend time reading files to understand an architecture, flow, or system (e.g., "How does auth work?"):
+Before you spend time reading files to understand an architecture, flow, or system:
 * **ALWAYS** call `vault_search_questions(query)` using keywords/tags to see if a previous agent already solved this.
 * If you find a match, call `vault_search_answer(prompt)` to retrieve the pre-computed answer instantly.
 
 ### 2. The "Read Before You Write" Rule (File Cache)
 Before you execute commands to read raw code files:
 * **ALWAYS** call `vault_check_file(filepath)` first. 
-* If the Vault returns a Cache Hit, trust the summary/AST and DO NOT read the raw file unless you explicitly need to edit it.
+* If the Vault returns a Cache Hit, trust the summary/AST and DO NOT read the raw file.
 
-### 3. The "Leave It Better Than You Found It" Rule (Updating Cache)
-Your memory is only as good as what you save. After you complete a task:
-* **Cache Modified Files:** If you edited a file, ALWAYS call `vault_cache_file(filepath, summary)` to update its digest and AST.
-* **Cache New Knowledge:** If you just spent time analyzing a complex architecture or debugging a hard issue, ALWAYS call `vault_cache_answer(prompt, response, dependencies, tags)`.
-   * *Dependencies:* You MUST provide the exact file paths your answer relies on so the Vault can auto-invalidate your answer if those files change.
-   * *Tags:* Provide 5-6 broad keyword tags (e.g., "auth, login, jwt") so future agents can easily discover your answer via `vault_search_questions`.
+### 3. External Dependencies & Git Context
+* **Notion/GitHub Docs:** Use `vault_cache_resource` to cache summaries of external links (pass the URI and `last_edited_time` as the version hash). 
+* **Diff Checking:** When a user asks you to fix uncommitted code, immediately run `vault_check_diff()` to see the Vault's summaries of the modified files *before* the user broke them.
 ```
 
 ## Available MCP Tools
@@ -93,9 +91,13 @@ Your memory is only as good as what you save. After you complete a task:
 - `vault_search(query, max_tokens)`: Search the vault using BM25 ranking.
 - `vault_cache_file(filepath, summary)`: Hash a file and cache its summary.
 - `vault_check_file(filepath)`: Verify a file's hash and return its cached summary + telemetry metrics.
+- `vault_cache_resource(uri, version_hash, summary)`: Manually cache external resources (Notion, GitHub) using explicit version hashes.
+- `vault_check_resource(uri, version_hash)`: Verify an external resource is up-to-date.
+- `vault_check_diff()`: Cross-reference uncommitted `git diff` modifications against the Vault's AST history to instantly debug code.
 - `vault_stats()`: View the ROI dashboard of tokens and time saved.
 - `vault_delete_memory(key)`: Delete a stored memory.
-- `vault_evict_file(filepath)`: Evict a file from the vault cache.- `vault_cache_answer(prompt, response, dependencies, tags)`: Save an AI-generated answer linked to specific files and keywords.
+- `vault_evict_file(filepath)`: Evict a file from the vault cache.
+- `vault_cache_answer(prompt, response, dependencies, tags)`: Save an AI-generated answer linked to specific files and keywords.
 - `vault_search_questions(query, max_results)`: Keyword-search an FTS5 index to find exactly how previous cached questions were phrased based on tags.
 - `vault_search_answer(prompt)`: Retrieve a cached AI answer (automatically invalidates if dependent files have changed).
 
@@ -108,9 +110,8 @@ To solve the classic LLM problem of "stale context hallucination," Agent Vault u
 
 When a future agent asks the same question, the Vault calculates the real-time SHA-256 digest of those dependencies. If any file has changed, the cached answer is instantly evicted, forcing the AI to generate a fresh, accurate response.
 
-### N-to-1 Tag Mapping
-To solve the problem of "brittle exact matching" (where *"How does login work?"* misses a cache for *"How does the login work?"*), agents can assign **tags** to cached answers. 
-Agents can use `vault_search_questions("login")` to hit the FTS5 index, discover the exact phrasing of the cached question, and then fetch the answer—bypassing the need for heavy vector databases!
+### External Resource Validation (v1.2.0)
+The cache fully supports external tools (Notion MCP, GitHub MCP). AI agents can pass dictionaries `{"notion://page/123": "Oct-01-2026"}` into the `dependencies` array. The Vault will effortlessly store the metadata, and when the cache is retrieved, the Vault hands validation control back to the AI agent to cross-check the timestamps using its own MCP servers!
 
 ## Global vs. Portable Mode
 

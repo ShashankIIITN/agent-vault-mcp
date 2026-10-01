@@ -85,7 +85,8 @@ class VaultStorage:
                     prompt TEXT,
                     response TEXT,
                     dependency_files TEXT,
-                    tags TEXT
+                    tags TEXT,
+                    tokens_saved_per_hit INTEGER DEFAULT 0
                 )
             ''')
             # Handle migration
@@ -116,6 +117,8 @@ class VaultStorage:
                 self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN prompt TEXT')
             elif 'tags' not in columns:
                 self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN tags TEXT')
+            if 'tokens_saved_per_hit' not in columns:
+                self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN tokens_saved_per_hit INTEGER DEFAULT 0')
                 
             self.conn.execute('''
                 CREATE VIRTUAL TABLE IF NOT EXISTS prompt_search USING fts5(
@@ -208,7 +211,55 @@ class VaultStorage:
         with self.conn:
             self.conn.execute("DELETE FROM file_cache WHERE filepath = ?", (filepath,))
 
+    def _is_ignored(self, filepath):
+        import subprocess
+        import os
+        try:
+            os_path = self._to_os_path(filepath)
+            cwd = self.project_root or os.path.dirname(os_path) or os.getcwd()
+            result = subprocess.run(
+                ['git', 'check-ignore', '-q', os_path],
+                cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+
+    def cache_resource(self, uri, version_hash, summary):
+        with self.conn:
+            self.conn.execute('''
+                INSERT INTO file_cache (filepath, digest, summary, tokens_saved_per_hit)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(filepath) DO UPDATE SET
+                    digest=excluded.digest,
+                    summary=excluded.summary,
+                    tokens_saved_per_hit=excluded.tokens_saved_per_hit
+            ''', (uri, version_hash, summary, 500))
+        return True
+
+    def check_resource(self, uri, version_hash):
+        cursor = self.conn.execute("SELECT digest, summary, tokens_saved_per_hit FROM file_cache WHERE filepath = ?", (uri,))
+        row = cursor.fetchone()
+        
+        if not row:
+            with self.conn:
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (uri, "resource_not_in_db"))
+            return {"cached": False, "reason": "not_in_db"}
+            
+        cached_digest, summary, tokens_saved = row
+        if version_hash == cached_digest:
+            with self.conn:
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 1, ?, ?)", (uri, tokens_saved, "resource_hit"))
+            return {"cached": True, "summary": summary}
+        else:
+            with self.conn:
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (uri, "resource_mismatch"))
+            return {"cached": False, "reason": "version_hash mismatch"}
+
     def cache_file(self, filepath, summary):
+        if self._is_ignored(filepath):
+            return False
         os_path = self._to_os_path(filepath)
         digest, raw_file_size = get_file_digest(os_path)
         if not digest:
@@ -300,22 +351,30 @@ class VaultStorage:
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
         
         deps_data = {}
+        total_dependency_size = 0
         for d in dependencies:
+            if isinstance(d, dict) and "uri" in d and "version_hash" in d:
+                deps_data[d["uri"]] = d["version_hash"]
+                continue
+            
             db_path = self._to_db_path(d)
             os_path = self._to_os_path(db_path)
             if os.path.exists(os_path):
-                digest, _ = get_file_digest(os_path)
+                digest, raw_size = get_file_digest(os_path)
                 deps_data[db_path] = digest
+                total_dependency_size += raw_size
                 
+        tokens_saved_per_hit = max(0, (total_dependency_size // 4) - (len(response) // 4))
         deps_json = json.dumps(deps_data)
+        
         with self.conn:
             context_dir = self.project_root or os.getcwd()
             # Delete old entry for this specific context to update
             self.conn.execute("DELETE FROM prompt_cache WHERE query_hash = ? AND context_dir = ?", (query_hash, context_dir))
             self.conn.execute('''
-                INSERT INTO prompt_cache (query_hash, context_dir, prompt, response, dependency_files, tags)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (query_hash, context_dir, prompt, response, deps_json, tags))
+                INSERT INTO prompt_cache (query_hash, context_dir, prompt, response, dependency_files, tags, tokens_saved_per_hit)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (query_hash, context_dir, prompt, response, deps_json, tags, tokens_saved_per_hit))
             self.conn.execute('''
                 INSERT INTO prompt_search (prompt, tags, query_hash)
                 VALUES (?, ?, ?)
@@ -365,16 +424,17 @@ class VaultStorage:
         
         context_dir = self.project_root or os.getcwd()
         cursor = self.conn.execute(
-            "SELECT id, response, dependency_files FROM prompt_cache WHERE query_hash = ? AND (context_dir = ? OR context_dir IS NULL)", 
+            "SELECT id, response, dependency_files, tokens_saved_per_hit FROM prompt_cache WHERE query_hash = ? AND (context_dir = ? OR context_dir IS NULL)", 
             (query_hash, context_dir)
         )
         rows = cursor.fetchall()
         
         for row in rows:
-            row_id, response, deps_json = row
+            row_id, response, deps_json, tokens_saved_per_hit = row
             deps_data = json.loads(deps_json)
             
             is_valid = True
+            unvalidated_deps = {}
             if isinstance(deps_data, list):
                 # Backwards compatibility: deps_data is a list of filepaths
                 for filepath in deps_data:
@@ -393,6 +453,11 @@ class VaultStorage:
             else:
                 # New logic: deps_data is a dict of {filepath: hash}
                 for filepath, saved_hash in deps_data.items():
+                    if "://" in filepath:
+                        # External dependency, skip local hashing
+                        unvalidated_deps[filepath] = saved_hash
+                        continue
+                        
                     os_path = self._to_os_path(filepath)
                     if not os.path.exists(os_path):
                         is_valid = False
@@ -403,7 +468,14 @@ class VaultStorage:
                         break
                     
             if is_valid:
-                return response
+                # Log metrics for semantic cache hit
+                tokens_saved = tokens_saved_per_hit if tokens_saved_per_hit is not None else 0
+                with self.conn:
+                    self.conn.execute('''
+                        INSERT INTO metrics (filepath, is_hit, tokens_saved, reason)
+                        VALUES (?, 1, ?, ?)
+                    ''', ("semantic_cache", tokens_saved, "Semantic cache hit"))
+                return {"response": response, "unvalidated_dependencies": unvalidated_deps}
             else:
                 # Evict stale cache entry
                 with self.conn:

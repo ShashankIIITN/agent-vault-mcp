@@ -159,6 +159,81 @@ def vault_search_answer(prompt: str) -> str:
     else:
         return "No valid cached answer found."
 
+
+
+@mcp.tool()
+def vault_cache_resource(uri: str, version_hash: str, summary: str) -> str:
+    """Cache the AST/summary of an external resource (Notion, GitHub) manually.
+    
+    Args:
+        uri: The unique identifier (e.g., notion://page/123)
+        version_hash: A metadata string to represent the current version (e.g., last_edited_time)
+        summary: The compressed AST or summary of the resource
+    """
+    storage.cache_resource(uri, version_hash, summary)
+    return f"Resource '{uri}' cached successfully."
+
+@mcp.tool()
+def vault_check_resource(uri: str, version_hash: str) -> str:
+    """Check if an external resource is cached and up to date.
+    
+    Args:
+        uri: The unique identifier
+        version_hash: The current metadata version you fetched from the external MCP server
+    """
+    res = storage.check_resource(uri, version_hash)
+    if res["cached"]:
+        return f"Resource '{uri}' is unchanged. Summary:\n{res['summary']}\n[Vault telemetry: Saved ~500 tokens by skipping raw fetch]"
+    else:
+        return f"Resource '{uri}' needs analysis. Reason: {res['reason']}"
+
+@mcp.tool()
+def vault_check_diff() -> str:
+    """Cross-references uncommitted git modifications against the Vault file cache.
+    Returns the cached AST summaries of files that have been modified.
+    """
+    import subprocess
+    import os
+    import hashlib
+    
+    context_dir = storage.project_root or os.getcwd()
+    
+    try:
+        result = subprocess.run(
+            ['git', 'diff', '--name-only', 'HEAD'],
+            cwd=context_dir, capture_output=True, text=True, check=True
+        )
+        modified_files = [f.strip() for f in result.stdout.split(chr(10)) if f.strip()]
+    except Exception as e:
+        return f"Failed to retrieve git diff: {e}"
+        
+    if not modified_files:
+        return "No uncommitted modifications found."
+        
+    output = "Modified files and their prior Vault AST summaries:" + chr(10)
+    for filepath in modified_files:
+        head_digest = None
+        try:
+            head_res = subprocess.run(['git', 'show', f'HEAD:{filepath}'], cwd=context_dir, capture_output=True)
+            if head_res.returncode == 0:
+                head_digest = hashlib.sha256(head_res.stdout).hexdigest()
+        except Exception:
+            pass
+
+        cursor = storage.conn.execute("SELECT digest, summary FROM file_cache WHERE filepath = ?", (filepath,))
+        row = cursor.fetchone()
+        
+        if row:
+            vault_digest, summary = row
+            if head_digest and vault_digest == head_digest:
+                output += chr(10) + f"--- {filepath} (AST exactly matches HEAD) ---" + chr(10) + summary + chr(10)
+            else:
+                output += chr(10) + f"--- {filepath} (WARNING: Stale AST from an older commit) ---" + chr(10) + summary + chr(10)
+        else:
+            output += chr(10) + f"--- {filepath} ---" + chr(10) + "(Not tracked in Vault)" + chr(10)
+            
+    return output
+
 def main():
     mcp.run()
 
