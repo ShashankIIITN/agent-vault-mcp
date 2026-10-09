@@ -145,17 +145,28 @@ def vault_search_questions(query: str, max_results: int = 5) -> str:
     return storage.search_questions(query, max_results)
 
 @mcp.tool()
-def vault_search_answer(prompt: str) -> str:
+def vault_search_answer(prompt: str, project: str = "") -> str:
     """Search for a cached AI response based on a prompt.
     Checks if dependency files have changed since caching.
-    
+
     Args:
         prompt: The user's prompt.
+        project: Only to fetch an answer cached for another project: its path, as listed by
+            vault_search_questions. By default the answer for this session's project is returned.
     """
-    result = storage.search_answer(prompt)
+    result = storage.search_answer(prompt, project=project or None)
     if not result:
         return "No valid cached answer found."
-    output = f"Cached Answer:\n{result['response']}"
+    if result["status"] == "choose":
+        return ("This question has cached answers for several projects:\n"
+                + "\n".join(f"- {p}" for p in result["projects"])
+                + '\nCall vault_search_answer again with project="<path>" for the one you need.')
+    if result["status"] == "elsewhere":
+        return ("No cached answer for this project. This question was answered for:\n"
+                + "\n".join(f"- {p}" for p in result["projects"])
+                + '\nIf one of those is what you need, call vault_search_answer again with project="<path>".')
+    header = f"Cached Answer (for {', '.join(result['projects'])}):" if project else "Cached Answer:"
+    output = f"{header}\n{result['response']}"
     external = result["unvalidated_dependencies"]
     if external:
         output += ("\n\nThis answer also depends on external resources the Vault cannot check. Confirm each is "
