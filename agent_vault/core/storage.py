@@ -41,12 +41,21 @@ def _match_case(path):
         tail = next((n for n in names if n.casefold() == folded), tail)
     return os.path.join(parent, tail)
 
+def _related(a, b):
+    """True if paths a and b are the same, or one contains the other."""
+    try:
+        common = os.path.commonpath([a, b])
+    except ValueError:  # different drives, or a relative path
+        return False
+    return common in (a, b)
+
 class VaultStorage:
     def __init__(self, db_path="vault.db", project_root=None):
         self.db_path = db_path
         # Canonicalise the root the same way as file paths, or relpath() between them breaks.
         self.project_root = _on_disk_case(os.path.realpath(project_root)) if project_root else None
         self._lock = threading.RLock()
+        self._repo_roots = {}  # directory -> git repo root, see _repo_root
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         try:
             os.chmod(self.db_path, 0o600)
@@ -83,15 +92,54 @@ class VaultStorage:
                 pass
         return abs_path
 
-    def _context_dirs(self):
-        """Values of prompt_cache.context_dir that belong to this project; the first is used for new rows.
+    # Cached answers belong to projects: the git repos of the files they depend on. In global mode a session
+    # sees an answer as local when one of its projects is the session's folder, inside it, or contains it,
+    # so a session opened on a parent folder of several repos sees all of them. A portable DB holds a single
+    # project, so there every answer is local.
 
-        A portable DB only holds one project, and is shared through git by teammates whose checkouts
-        live at other absolute paths, so its rows are stored as "." (older rows used the absolute root).
-        """
-        if self.project_root:
-            return [".", self.project_root]
-        return [os.getcwd()]
+    def _session_scope(self):
+        """The folder this server's session was launched in."""
+        return _on_disk_case(os.path.realpath(os.getcwd()))
+
+    def _repo_root(self, directory):
+        """Git repo root containing directory; a directory outside any repo stands for itself."""
+        import subprocess
+        if directory not in self._repo_roots:
+            root = directory
+            try:
+                result = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=directory,
+                                        capture_output=True, text=True)
+                if result.returncode == 0 and result.stdout.strip():
+                    root = _on_disk_case(os.path.realpath(result.stdout.strip()))
+            except OSError:  # directory gone, or git not installed
+                pass
+            self._repo_roots[directory] = root
+        return self._repo_roots[directory]
+
+    def _projects_for(self, deps_data, context_dir):
+        """Projects for an answer: the repos of its local dependency files, else the folder it was cached from."""
+        projects = sorted({self._repo_root(os.path.dirname(p)) for p in deps_data if "://" not in p})
+        if projects:
+            return projects
+        return [context_dir] if context_dir and context_dir != "." else []
+
+    def _row_projects(self, row_id, projects_json, deps_json, context_dir):
+        """Projects of a prompt_cache row; computed and saved for rows cached before projects existed."""
+        if projects_json is not None:
+            return json.loads(projects_json)
+        projects = self._projects_for(json.loads(deps_json), context_dir)
+        with self.conn:
+            self.conn.execute("UPDATE prompt_cache SET projects = ? WHERE id = ?", (json.dumps(projects), row_id))
+        return projects
+
+    def _in_scope(self, projects, scope):
+        # Old rows with neither files nor a folder to place them were visible everywhere; they still are.
+        return not projects or any(_related(p, scope) for p in projects)
+
+    def _delete_answer(self, row_id):
+        # The caller holds the transaction. Search rows share their answer's id.
+        self.conn.execute("DELETE FROM prompt_cache WHERE id = ?", (row_id,))
+        self.conn.execute("DELETE FROM prompt_search WHERE rowid = ?", (row_id,))
 
     def _init_db(self):
         with self.conn:
@@ -178,11 +226,28 @@ class VaultStorage:
                 self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN tags TEXT')
             if 'tokens_saved_per_hit' not in columns:
                 self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN tokens_saved_per_hit INTEGER DEFAULT 0')
-                
+            if 'projects' not in columns:
+                # JSON list of project paths; NULL until computed, see _row_projects
+                self.conn.execute('ALTER TABLE prompt_cache ADD COLUMN projects TEXT')
+
             self.conn.execute('''
                 CREATE VIRTUAL TABLE IF NOT EXISTS prompt_search USING fts5(
                     prompt, tags, query_hash UNINDEXED
                 )
+            ''')
+            # Keep exactly one search row per cached answer, sharing its id. Older versions added a row on
+            # every re-cache and never removed any, so drop duplicates and orphans and add missing rows.
+            # Runs on every start because servers on an older version may still be writing to this DB.
+            self.conn.execute('''
+                DELETE FROM prompt_search WHERE rowid NOT IN (
+                    SELECT s.rowid FROM prompt_search s
+                    JOIN prompt_cache c ON c.id = s.rowid AND c.query_hash = s.query_hash
+                )
+            ''')
+            self.conn.execute('''
+                INSERT INTO prompt_search (rowid, prompt, tags, query_hash)
+                SELECT id, prompt, tags, query_hash FROM prompt_cache
+                WHERE id NOT IN (SELECT rowid FROM prompt_search)
             ''')
 
     @_locked
@@ -485,21 +550,31 @@ class VaultStorage:
         tokens_saved_per_hit = max(0, (total_dependency_size // 4) - (len(response) // 4))
         deps_json = json.dumps(deps_data)
 
+        if self.project_root:
+            context_dir, projects = ".", None
+        else:
+            context_dir = self._session_scope()
+            projects = self._projects_for(deps_data, context_dir)
+
+        # Replace earlier answers to this question about the same code. In global mode answers about other
+        # projects are kept: the same question can mean different things in different repos.
+        rows = self.conn.execute(
+            "SELECT id, projects, dependency_files, context_dir FROM prompt_cache WHERE query_hash = ?", (query_hash,)
+        ).fetchall()
+        replaced = [row[0] for row in rows if self.project_root or set(self._row_projects(*row)) & set(projects)]
+
         with self.conn:
-            context_dirs = self._context_dirs()
-            # Delete old entry for this specific context to update
-            self.conn.execute(
-                f"DELETE FROM prompt_cache WHERE query_hash = ? AND context_dir IN ({','.join('?' * len(context_dirs))})",
-                (query_hash, *context_dirs)
-            )
+            for row_id in replaced:
+                self._delete_answer(row_id)
+            cursor = self.conn.execute('''
+                INSERT INTO prompt_cache (query_hash, context_dir, prompt, response, dependency_files, tags, tokens_saved_per_hit, projects)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (query_hash, context_dir, prompt, response, deps_json, tags, tokens_saved_per_hit,
+                  None if projects is None else json.dumps(projects)))
             self.conn.execute('''
-                INSERT INTO prompt_cache (query_hash, context_dir, prompt, response, dependency_files, tags, tokens_saved_per_hit)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (query_hash, context_dirs[0], prompt, response, deps_json, tags, tokens_saved_per_hit))
-            self.conn.execute('''
-                INSERT INTO prompt_search (prompt, tags, query_hash)
-                VALUES (?, ?, ?)
-            ''', (prompt, tags, query_hash))
+                INSERT INTO prompt_search (rowid, prompt, tags, query_hash)
+                VALUES (?, ?, ?, ?)
+            ''', (cursor.lastrowid, prompt, tags, query_hash))
         return ignored
         
     @_locked
@@ -513,97 +588,124 @@ class VaultStorage:
         fts_query = ' OR '.join(f'"{word}"*' for word in safe_query.split())
             
         try:
-            cursor = self.conn.execute('''
-                SELECT prompt, tags, rank 
-                FROM prompt_search 
-                WHERE prompt_search MATCH ? 
-                ORDER BY rank LIMIT ?
-            ''', (fts_query, max_results))
+            # The join also skips search rows written by older versions that don't match an answer.
+            rows = self.conn.execute('''
+                SELECT c.id, c.prompt, c.tags, c.projects, c.dependency_files, c.context_dir
+                FROM (SELECT rowid, query_hash, rank FROM prompt_search WHERE prompt_search MATCH ?) s
+                JOIN prompt_cache c ON c.id = s.rowid AND c.query_hash = s.query_hash
+                ORDER BY s.rank
+            ''', (fts_query,)).fetchall()
         except Exception as e:
             return f"Search failed: {e}"
-            
-        rows = cursor.fetchall()
+
         if not rows:
             return "No matching questions found in the cache."
-            
-        out = [f"Found {len(rows)} matching cached questions:"]
-        for i, (p, t, r) in enumerate(rows, 1):
-            out.append(f"--- Option {i} ---")
-            out.append(f"Prompt: {p}")
-            out.append(f"Tags: {t if t else 'None'}")
-            out.append("")
+
+        # Up to max_results from this project, and as many again from other projects.
+        if self.project_root:
+            sections = [("", [(p, t, None) for _, p, t, _, _, _ in rows[:max_results]])]
+        else:
+            scope = self._session_scope()
+            local, other = [], []
+            for row_id, p, t, projects_json, deps_json, context_dir in rows:
+                projects = self._row_projects(row_id, projects_json, deps_json, context_dir)
+                (local if self._in_scope(projects, scope) else other).append((p, t, projects))
+            sections = [("From this project:", local[:max_results]), ("From other projects:", other[:max_results])]
+
+        found = sum(len(items) for _, items in sections)
+        out = [f"Found {found} matching cached questions:"]
+        i = 0
+        for heading, items in sections:
+            if not items:
+                continue
+            if heading:
+                out.append(heading)
+            for p, t, projects in items:
+                i += 1
+                out.append(f"--- Option {i} ---")
+                out.append(f"Prompt: {p}")
+                out.append(f"Tags: {t if t else 'None'}")
+                if projects:
+                    out.append(f"Project: {', '.join(projects)}")
+                out.append("")
         out.append("Use vault_search_answer with the exact Prompt string if one matches your intent.")
+        if not self.project_root and other:
+            out.append('For a question from another project, also pass project="<its Project path>".')
         return "\n".join(out)
 
 
     @_locked
-    def search_answer(self, prompt):
+    def search_answer(self, prompt, project=None):
+        """Find the cached answer to prompt that applies to this session.
+
+        In global mode that's an answer for one of the session's projects, or for `project` (a path) when
+        given. Stale answers are evicted. Returns None if nothing is cached, else a dict whose "status" is:
+          "hit": with "response", its "projects" and "unvalidated_dependencies" (external ones to re-check)
+          "choose": answers exist for several projects in scope; "projects" lists them, one label each
+          "elsewhere": answers exist only for other projects; "projects" lists them
+        """
         import hashlib
-        import json
-        import os
-        from .dsa import get_file_digest
-        
+
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
-        
-        context_dirs = self._context_dirs()
-        cursor = self.conn.execute(
-            "SELECT id, response, dependency_files, tokens_saved_per_hit FROM prompt_cache "
-            f"WHERE query_hash = ? AND (context_dir IN ({','.join('?' * len(context_dirs))}) OR context_dir IS NULL)",
-            (query_hash, *context_dirs)
-        )
-        rows = cursor.fetchall()
-        
-        for row in rows:
-            row_id, response, deps_json, tokens_saved_per_hit = row
-            deps_data = json.loads(deps_json)
-            
-            is_valid = True
-            unvalidated_deps = {}
-            if isinstance(deps_data, list):
-                # Backwards compatibility: deps_data is a list of filepaths
-                for filepath in deps_data:
-                    os_path = self._to_os_path(filepath)
-                    current_digest, _ = get_file_digest(os_path)
-                    if not current_digest:
-                        is_valid = False
-                        break
-                        
-                    c = self.conn.execute("SELECT digest FROM file_cache WHERE filepath = ?", (filepath,))
-                    cached_row = c.fetchone()
-                    
-                    if not cached_row or cached_row[0] != current_digest:
-                        is_valid = False
-                        break
-            else:
-                # New logic: deps_data is a dict of {filepath: hash}
-                for filepath, saved_hash in deps_data.items():
-                    if "://" in filepath:
-                        # External dependency, skip local hashing
-                        unvalidated_deps[filepath] = saved_hash
-                        continue
-                        
-                    os_path = self._to_os_path(filepath)
-                    if not os.path.exists(os_path):
-                        is_valid = False
-                        break
-                    current_digest, _ = get_file_digest(os_path)
-                    if current_digest != saved_hash:
-                        is_valid = False
-                        break
-                    
-            if is_valid:
-                # Log metrics for semantic cache hit
-                tokens_saved = tokens_saved_per_hit if tokens_saved_per_hit is not None else 0
+        if self.project_root:
+            scope = None
+        elif project:
+            scope = _on_disk_case(os.path.realpath(os.path.expanduser(project)))
+        else:
+            scope = self._session_scope()
+
+        rows = self.conn.execute(
+            "SELECT id, response, dependency_files, tokens_saved_per_hit, projects, context_dir "
+            "FROM prompt_cache WHERE query_hash = ? ORDER BY id DESC", (query_hash,)
+        ).fetchall()
+        valid, elsewhere = [], set()
+        for row_id, response, deps_json, tokens_saved_per_hit, projects_json, context_dir in rows:
+            projects = [] if scope is None else self._row_projects(row_id, projects_json, deps_json, context_dir)
+            if scope is not None and not self._in_scope(projects, scope):
+                elsewhere.update(projects)
+                continue
+            unvalidated = self._check_dependencies(json.loads(deps_json))
+            if unvalidated is None:
                 with self.conn:
-                    self.conn.execute('''
-                        INSERT INTO metrics (filepath, is_hit, tokens_saved, reason)
-                        VALUES (?, 1, ?, ?)
-                    ''', ("semantic_cache", tokens_saved, "Semantic cache hit"))
-                return {"response": response, "unvalidated_dependencies": unvalidated_deps}
-            else:
-                # Evict stale cache entry
-                with self.conn:
-                    self.conn.execute("DELETE FROM prompt_cache WHERE id = ?", (row_id,))
-                    
+                    self._delete_answer(row_id)
+                continue
+            valid.append((response, projects, unvalidated, tokens_saved_per_hit))
+
+        labels = list(dict.fromkeys(", ".join(projects) for _, projects, _, _ in valid))
+        if len(labels) > 1 and not project:
+            return {"status": "choose", "projects": labels}
+        if valid:
+            response, projects, unvalidated, tokens_saved_per_hit = valid[0]  # newest
+            with self.conn:
+                self.conn.execute('''
+                    INSERT INTO metrics (filepath, is_hit, tokens_saved, reason)
+                    VALUES (?, 1, ?, ?)
+                ''', ("semantic_cache", tokens_saved_per_hit or 0, "Semantic cache hit"))
+            return {"status": "hit", "response": response, "projects": projects,
+                    "unvalidated_dependencies": unvalidated}
+        if elsewhere:
+            return {"status": "elsewhere", "projects": sorted(elsewhere)}
         return None
 
+    def _check_dependencies(self, deps_data):
+        """None if a local dependency changed or is gone; else the external deps for the caller to re-check."""
+        from .dsa import get_file_digest
+
+        unvalidated_deps = {}
+        if isinstance(deps_data, list):
+            # Backwards compatibility: a list of filepaths, checked against the file cache
+            for filepath in deps_data:
+                current_digest, _ = get_file_digest(self._to_os_path(filepath))
+                cached_row = self.conn.execute("SELECT digest FROM file_cache WHERE filepath = ?", (filepath,)).fetchone()
+                if not current_digest or not cached_row or cached_row[0] != current_digest:
+                    return None
+            return unvalidated_deps
+        # A dict of {filepath: digest}, or {uri: version} for external dependencies
+        for filepath, saved_hash in deps_data.items():
+            if "://" in filepath:
+                unvalidated_deps[filepath] = saved_hash
+                continue
+            current_digest, _ = get_file_digest(self._to_os_path(filepath))
+            if current_digest != saved_hash:
+                return None
+        return unvalidated_deps

@@ -14,8 +14,12 @@ class PromptCacheTest(unittest.TestCase):
         with open(self.dep, "w") as f:
             f.write("print('hello')\n")
         self.storages = []
+        # The session's folder decides which answers are local in global mode.
+        self.old_cwd = os.getcwd()
+        os.chdir(self.root)
 
     def tearDown(self):
+        os.chdir(self.old_cwd)
         for s in self.storages:
             s.close()
         self.tmp.cleanup()
