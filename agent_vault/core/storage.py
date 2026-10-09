@@ -471,11 +471,9 @@ class VaultStorage:
                 if head.returncode == 0:
                     head_content = head.stdout
                     head_digest1 = hashlib.sha256(head_content).hexdigest()
-                    head_digest2 = hashlib.sha256(head_content.replace(b'
-', b'
-').replace(b'
-', b'
-')).hexdigest()
+
+
+                    head_digest2 = hashlib.sha256(head_content.replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')).hexdigest()
                     head_digests = (head_digest1, head_digest2)
                 else:
                     head_digests = ()
@@ -485,7 +483,7 @@ class VaultStorage:
                 elif cached_digest in head_digests:
                     entry["state"] = "head"
                 else:
-                    entry["state"] = "older
+                    entry["state"] = "older"
             entries.append(entry)
         return entries
 
