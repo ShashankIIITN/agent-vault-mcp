@@ -3,19 +3,13 @@ from .core.storage import VaultStorage
 import os
 
 import sys
-from typing import Union, List
+from typing import Union, List, Dict
 
 # Initialize FastMCP server
 mcp = MCPServer("AgentVault")
 
 def normalize_path(filepath: str) -> str:
-    abs_path = os.path.abspath(os.path.realpath(filepath))
-    if PROJECT_ROOT:
-        try:
-            return os.path.relpath(abs_path, start=PROJECT_ROOT).replace(os.sep, '/')
-        except ValueError:
-            pass
-    return abs_path
+    return storage.normalize_path(filepath)
 
 
 # Initialize storage
@@ -85,7 +79,7 @@ def vault_cache_file(filepath: str, summary: str) -> str:
 @mcp.tool()
 def vault_check_file(filepath: str) -> str:
     """Check if a file has been modified since it was last cached.
-    Uses O(1) Bloom Filter for fast rejection, then SHA-256 for exact match.
+    Uses an indexed database lookup for fast rejection, then SHA-256 for exact match.
     
     Args:
         filepath: Absolute path to the file.
@@ -118,20 +112,25 @@ def vault_evict_file(filepath: str) -> str:
     return f"File '{filepath}' evicted successfully."
 
 @mcp.tool()
-def vault_cache_answer(prompt: str, response: str, dependencies: Union[str, List[str]], tags: Union[str, List[str]] = "") -> str:
+def vault_cache_answer(prompt: str, response: str, dependencies: Union[str, List[Union[str, Dict[str, str]]]], tags: Union[str, List[str]] = "") -> str:
+    """Cache an AI response with its file dependencies and tags.
+
+    Args:
+        prompt: The exact prompt/question.
+        response: The AI's generated response.
+        dependencies: Absolute paths of the files this response depends on (a list, or one comma-separated
+            string). For an external page, add {"<uri>": "<version>"} to the list, e.g.
+            {"notion://page/123": "<last_edited_time>"}; it is handed back for you to re-check on retrieval.
+        tags: Comma separated tags (e.g. 'auth, login, jwt') to help future agents find this prompt.
+    """
     if isinstance(dependencies, str):
         dependencies = [d.strip() for d in dependencies.split(",") if d.strip()]
     if isinstance(tags, list):
         tags = ", ".join(tags)
-    """Cache an AI response with its file dependencies and tags.
-    
-    Args:
-        prompt: The exact prompt/question.
-        response: The AI's generated response.
-        dependencies: A list of absolute or relative file paths this response depends on.
-        tags: Comma separated tags (e.g. 'auth, login, jwt') to help future agents find this prompt.
-    """
-    storage.cache_answer(prompt, response, dependencies, tags)
+    ignored = storage.cache_answer(prompt, response, dependencies, tags)
+    if ignored:
+        return ("Answer cached, but these dependencies were ignored (file not found, or external URI without a version), "
+                "so changes to them won't invalidate it: " + ", ".join(ignored))
     return "Answer cached successfully."
 
 @mcp.tool()
@@ -154,10 +153,15 @@ def vault_search_answer(prompt: str) -> str:
         prompt: The user's prompt.
     """
     result = storage.search_answer(prompt)
-    if result:
-        return f"Cached Answer:\n{result}"
-    else:
+    if not result:
         return "No valid cached answer found."
+    output = f"Cached Answer:\n{result['response']}"
+    external = result["unvalidated_dependencies"]
+    if external:
+        output += ("\n\nThis answer also depends on external resources the Vault cannot check. Confirm each is "
+                   "still at the version below before trusting it; if one changed, regenerate the answer and cache it again:\n"
+                   + "\n".join(f"- {uri}: {version}" for uri, version in external.items()))
+    return output
 
 
 
@@ -189,49 +193,31 @@ def vault_check_resource(uri: str, version_hash: str) -> str:
 
 @mcp.tool()
 def vault_check_diff() -> str:
-    """Cross-references uncommitted git modifications against the Vault file cache.
-    Returns the cached AST summaries of files that have been modified.
+    """Cross-references uncommitted git changes (including untracked files) against the Vault file cache.
+    Returns each changed file's cached summary and whether it describes HEAD (the version before the
+    changes), the current file, or an older version.
     """
-    import subprocess
-    import os
-    import hashlib
-    
     context_dir = storage.project_root or os.getcwd()
-    
     try:
-        result = subprocess.run(
-            ['git', 'diff', '--name-only', 'HEAD'],
-            cwd=context_dir, capture_output=True, text=True, check=True
-        )
-        modified_files = [f.strip() for f in result.stdout.split(chr(10)) if f.strip()]
+        entries = storage.diff_entries(context_dir)
     except Exception as e:
         return f"Failed to retrieve git diff: {e}"
-        
-    if not modified_files:
-        return "No uncommitted modifications found."
-        
-    output = "Modified files and their prior Vault AST summaries:" + chr(10)
-    for filepath in modified_files:
-        head_digest = None
-        try:
-            head_res = subprocess.run(['git', 'show', f'HEAD:{filepath}'], cwd=context_dir, capture_output=True)
-            if head_res.returncode == 0:
-                head_digest = hashlib.sha256(head_res.stdout).hexdigest()
-        except Exception:
-            pass
 
-        cursor = storage.conn.execute("SELECT digest, summary FROM file_cache WHERE filepath = ?", (filepath,))
-        row = cursor.fetchone()
-        
-        if row:
-            vault_digest, summary = row
-            if head_digest and vault_digest == head_digest:
-                output += chr(10) + f"--- {filepath} (AST exactly matches HEAD) ---" + chr(10) + summary + chr(10)
-            else:
-                output += chr(10) + f"--- {filepath} (WARNING: Stale AST from an older commit) ---" + chr(10) + summary + chr(10)
+    if not entries:
+        return "No uncommitted modifications found."
+
+    labels = {
+        "head": "summary matches HEAD, before these changes",
+        "working": "summary already matches the current file",
+        "older": "WARNING: summary is from an older version",
+    }
+    output = "Modified files and their prior Vault AST summaries:\n"
+    for entry in entries:
+        name = entry["path"] + (" [untracked]" if entry["untracked"] else "")
+        if entry["summary"] is None:
+            output += f"\n--- {name} ---\n(Not tracked in Vault)\n"
         else:
-            output += chr(10) + f"--- {filepath} ---" + chr(10) + "(Not tracked in Vault)" + chr(10)
-            
+            output += f"\n--- {name} ({labels[entry['state']]}) ---\n{entry['summary']}\n"
     return output
 
 def main():

@@ -1,20 +1,68 @@
 import sqlite3
 import os
 import json
-from .dsa import BloomFilter, get_file_digest, TokenBoundedMinHeap
+import functools
+import threading
+from .dsa import get_file_digest, TokenBoundedMinHeap
+
+def _locked(method):
+    # The MCP SDK runs sync tools on worker threads, so parallel tool calls share
+    # self.conn. sqlite3 connections (and their transactions) are not safe to use
+    # concurrently, so every public method holds the lock for its whole duration.
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+def _on_disk_case(path):
+    """Return absolute `path` with each component spelled as it is on disk.
+
+    Case-insensitive filesystems (macOS, Windows) accept any casing and realpath
+    keeps whatever was typed, so one file could otherwise be cached under several keys.
+    Paths that don't exist as typed are returned unchanged.
+    """
+    if not os.path.exists(path):
+        return path
+    return _match_case(path)
+
+def _match_case(path):
+    head, tail = os.path.split(path)
+    if not tail:
+        return path
+    parent = _match_case(head)
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return os.path.join(parent, tail)
+    if tail not in names:
+        # The path exists, so this level is case-insensitive and the match is unique.
+        folded = tail.casefold()
+        tail = next((n for n in names if n.casefold() == folded), tail)
+    return os.path.join(parent, tail)
 
 class VaultStorage:
     def __init__(self, db_path="vault.db", project_root=None):
         self.db_path = db_path
-        self.project_root = project_root
+        # Canonicalise the root the same way as file paths, or relpath() between them breaks.
+        self.project_root = _on_disk_case(os.path.realpath(project_root)) if project_root else None
+        self._lock = threading.RLock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         try:
             os.chmod(self.db_path, 0o600)
         except OSError:
             pass
-        self.conn.execute("PRAGMA journal_mode=WAL;")
+        if self.project_root:
+            # A portable DB is meant to be committed to git, so every write must land in the main file:
+            # in WAL mode it sits in a -wal side file until checkpointed, and a committed copy can be empty.
+            # Leaving WAL fails while another session has the DB open; a later start retries.
+            try:
+                self.conn.execute("PRAGMA journal_mode=DELETE;")
+            except sqlite3.OperationalError:
+                pass
+        else:
+            self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA busy_timeout=5000;")
-        self.bloom_filter = BloomFilter()
         self._init_db()
 
     
@@ -24,15 +72,26 @@ class VaultStorage:
             return os.path.join(self.project_root, db_path)
         return db_path
         
-    def _to_db_path(self, filepath):
+    def normalize_path(self, filepath):
+        """Canonical cache key for a file: relative to project_root if set, else absolute."""
         import os
-        abs_path = os.path.abspath(os.path.realpath(filepath))
+        abs_path = _on_disk_case(os.path.abspath(os.path.realpath(filepath)))
         if self.project_root:
             try:
                 return os.path.relpath(abs_path, start=self.project_root).replace(os.sep, '/')
             except ValueError:
                 pass
         return abs_path
+
+    def _context_dirs(self):
+        """Values of prompt_cache.context_dir that belong to this project; the first is used for new rows.
+
+        A portable DB only holds one project, and is shared through git by teammates whose checkouts
+        live at other absolute paths, so its rows are stored as "." (older rows used the absolute root).
+        """
+        if self.project_root:
+            return [".", self.project_root]
+        return [os.getcwd()]
 
     def _init_db(self):
         with self.conn:
@@ -126,14 +185,7 @@ class VaultStorage:
                 )
             ''')
 
-        # Hydrate bloom filter with existing files
-        try:
-            cursor = self.conn.execute("SELECT filepath FROM file_cache")
-            for row in cursor:
-                self.bloom_filter.add(row[0])
-        except Exception:
-            pass
-
+    @_locked
     def store_memory(self, key, content, tags, tokens=None):
         if tokens is None:
             # simple token estimation (1 token ~= 4 chars)
@@ -147,6 +199,7 @@ class VaultStorage:
                 (key, content, tags, tokens)
             )
 
+    @_locked
     def search_memory(self, query, max_tokens=2000):
         # We use BM25 which is built into FTS5 via ORDER BY rank
         # Standard FTS5 match query
@@ -199,14 +252,17 @@ class VaultStorage:
             
         return heap.get_items()
 
+    @_locked
     def close(self):
         if self.conn:
             self.conn.close()
 
+    @_locked
     def delete_memory(self, key):
         with self.conn:
             self.conn.execute("DELETE FROM memories WHERE key = ?", (key,))
 
+    @_locked
     def evict_file(self, filepath):
         with self.conn:
             self.conn.execute("DELETE FROM file_cache WHERE filepath = ?", (filepath,))
@@ -226,6 +282,7 @@ class VaultStorage:
             return False
 
 
+    @_locked
     def cache_resource(self, uri, version_hash, summary):
         with self.conn:
             self.conn.execute('''
@@ -238,6 +295,7 @@ class VaultStorage:
             ''', (uri, version_hash, summary, 500))
         return True
 
+    @_locked
     def check_resource(self, uri, version_hash):
         cursor = self.conn.execute("SELECT digest, summary, tokens_saved_per_hit FROM file_cache WHERE filepath = ?", (uri,))
         row = cursor.fetchone()
@@ -257,6 +315,7 @@ class VaultStorage:
                 self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (uri, "resource_mismatch"))
             return {"cached": False, "reason": "version_hash mismatch"}
 
+    @_locked
     def cache_file(self, filepath, summary):
         if self._is_ignored(filepath):
             return False
@@ -278,17 +337,21 @@ class VaultStorage:
                     summary=excluded.summary,
                     tokens_saved_per_hit=excluded.tokens_saved_per_hit
             ''', (filepath, digest, summary, tokens_saved_per_hit))
-            
-        self.bloom_filter.add(filepath)
+
         return True
 
+    @_locked
     def check_file(self, filepath):
-        # 1. Fast rejection
-        if not self.bloom_filter.check(filepath):
+        # 1. Fast rejection: indexed primary-key lookup, before paying to hash the file.
+        # Reading the DB (not per-process state) keeps every server process sharing it consistent.
+        cursor = self.conn.execute("SELECT digest, summary, tokens_saved_per_hit FROM file_cache WHERE filepath = ?", (filepath,))
+        row = cursor.fetchone()
+
+        if not row:
             with self.conn:
-                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "not_in_bloom"))
-            return {"cached": False, "reason": "Not in bloom filter"}
-            
+                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "not_in_db"))
+            return {"cached": False, "reason": "Not in database"}
+
         # 2. Check digest
         os_path = self._to_os_path(filepath)
         current_digest, _ = get_file_digest(os_path)
@@ -296,15 +359,7 @@ class VaultStorage:
              with self.conn:
                  self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "not_found"))
              return {"cached": False, "reason": "File not found or unreadable"}
-             
-        cursor = self.conn.execute("SELECT digest, summary, tokens_saved_per_hit FROM file_cache WHERE filepath = ?", (filepath,))
-        row = cursor.fetchone()
-        
-        if not row:
-            with self.conn:
-                self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "not_in_db"))
-            return {"cached": False, "reason": "Not in database"}
-            
+
         cached_digest, summary, tokens_saved_per_hit = row
         if current_digest == cached_digest:
             with self.conn:
@@ -315,6 +370,50 @@ class VaultStorage:
                 self.conn.execute("INSERT INTO metrics (filepath, is_hit, tokens_saved, reason) VALUES (?, 0, 0, ?)", (filepath, "digest_mismatch"))
             return {"cached": False, "reason": "Digest mismatch"}
 
+    @_locked
+    def get_file_entry(self, filepath):
+        """Return (digest, summary) cached for filepath, or None."""
+        cursor = self.conn.execute("SELECT digest, summary FROM file_cache WHERE filepath = ?", (filepath,))
+        return cursor.fetchone()
+
+    def diff_entries(self, cwd):
+        """Cached summaries for the uncommitted changes (including untracked files) of the git repo at cwd.
+
+        Returns a list of dicts: path (relative to the repo root), untracked, summary (None if not
+        cached), and state: which version the summary was cached from -- "head" (before the changes),
+        "working" (the current file) or "older". Raises if git fails.
+        """
+        import subprocess
+        import hashlib
+
+        def git(where, *args):
+            return os.fsdecode(subprocess.run(['git', *args], cwd=where, capture_output=True, check=True).stdout)
+
+        top = git(cwd, 'rev-parse', '--show-toplevel').strip()
+        # Run from the repo root so all paths are relative to it. -z: NUL-separated, never quoted,
+        # so non-ASCII file names come through intact.
+        changed = [p for p in git(top, 'diff', '--name-only', '-z', 'HEAD').split('\0') if p]
+        untracked = [p for p in git(top, 'ls-files', '-z', '--others', '--exclude-standard').split('\0') if p]
+
+        entries = []
+        for rel in changed + untracked:
+            abs_path = os.path.join(top, rel)
+            entry = {"path": rel, "untracked": rel not in changed, "summary": None, "state": None}
+            row = self.get_file_entry(self.normalize_path(abs_path))
+            if row:
+                cached_digest, entry["summary"] = row
+                head = subprocess.run(['git', 'show', f'HEAD:{rel}'], cwd=top, capture_output=True)
+                head_digest = hashlib.sha256(head.stdout).hexdigest() if head.returncode == 0 else None
+                if cached_digest == get_file_digest(abs_path)[0]:
+                    entry["state"] = "working"
+                elif cached_digest == head_digest:
+                    entry["state"] = "head"
+                else:
+                    entry["state"] = "older"
+            entries.append(entry)
+        return entries
+
+    @_locked
     def get_metrics_dashboard(self):
         cursor = self.conn.execute("SELECT COUNT(*), SUM(is_hit), SUM(tokens_saved) FROM metrics")
         row = cursor.fetchone()
@@ -342,45 +441,68 @@ class VaultStorage:
             f"==========================="
         )
 
+    @_locked
     def cache_answer(self, prompt, response, dependencies, tags=""):
+        """Cache response for prompt, invalidated when any dependency changes.
+
+        Each dependency is a file path, or a dict of external resources: {"<uri>": "<version>"}
+        or {"uri": ..., "version_hash": ...}. Returns the dependencies that were ignored: paths
+        that don't exist, and external URIs without a version.
+        """
         import hashlib
         import json
         import os
         from .dsa import get_file_digest
-        
+
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
-        
+
         deps_data = {}
+        ignored = []
         total_dependency_size = 0
         for d in dependencies:
-            if isinstance(d, dict) and "uri" in d and "version_hash" in d:
-                deps_data[d["uri"]] = d["version_hash"]
+            if isinstance(d, dict):
+                pairs = [(d["uri"], d["version_hash"])] if "uri" in d and "version_hash" in d else d.items()
+                for uri, version in pairs:
+                    # search_answer tells external deps from file paths by the "://"
+                    if "://" in uri and version:
+                        deps_data[uri] = version
+                    else:
+                        ignored.append(uri)
                 continue
-            
-            db_path = self._to_db_path(d)
+            if "://" in d:
+                ignored.append(d)
+                continue
+
+            db_path = self.normalize_path(d)
             os_path = self._to_os_path(db_path)
             if os.path.exists(os_path):
                 digest, raw_size = get_file_digest(os_path)
                 deps_data[db_path] = digest
                 total_dependency_size += raw_size
-                
+            else:
+                ignored.append(d)
+
         tokens_saved_per_hit = max(0, (total_dependency_size // 4) - (len(response) // 4))
         deps_json = json.dumps(deps_data)
-        
+
         with self.conn:
-            context_dir = self.project_root or os.getcwd()
+            context_dirs = self._context_dirs()
             # Delete old entry for this specific context to update
-            self.conn.execute("DELETE FROM prompt_cache WHERE query_hash = ? AND context_dir = ?", (query_hash, context_dir))
+            self.conn.execute(
+                f"DELETE FROM prompt_cache WHERE query_hash = ? AND context_dir IN ({','.join('?' * len(context_dirs))})",
+                (query_hash, *context_dirs)
+            )
             self.conn.execute('''
                 INSERT INTO prompt_cache (query_hash, context_dir, prompt, response, dependency_files, tags, tokens_saved_per_hit)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (query_hash, context_dir, prompt, response, deps_json, tags, tokens_saved_per_hit))
+            ''', (query_hash, context_dirs[0], prompt, response, deps_json, tags, tokens_saved_per_hit))
             self.conn.execute('''
                 INSERT INTO prompt_search (prompt, tags, query_hash)
                 VALUES (?, ?, ?)
             ''', (prompt, tags, query_hash))
-        return True
+        return ignored
         
+    @_locked
     def search_questions(self, query, max_results=5):
         # Sanitize query
         safe_query = ''.join(c if c.isalnum() or c.isspace() else ' ' for c in query).strip()
@@ -414,6 +536,7 @@ class VaultStorage:
         return "\n".join(out)
 
 
+    @_locked
     def search_answer(self, prompt):
         import hashlib
         import json
@@ -422,10 +545,11 @@ class VaultStorage:
         
         query_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
         
-        context_dir = self.project_root or os.getcwd()
+        context_dirs = self._context_dirs()
         cursor = self.conn.execute(
-            "SELECT id, response, dependency_files, tokens_saved_per_hit FROM prompt_cache WHERE query_hash = ? AND (context_dir = ? OR context_dir IS NULL)", 
-            (query_hash, context_dir)
+            "SELECT id, response, dependency_files, tokens_saved_per_hit FROM prompt_cache "
+            f"WHERE query_hash = ? AND (context_dir IN ({','.join('?' * len(context_dirs))}) OR context_dir IS NULL)",
+            (query_hash, *context_dirs)
         )
         rows = cursor.fetchall()
         

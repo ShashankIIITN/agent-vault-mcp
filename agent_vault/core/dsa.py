@@ -2,31 +2,6 @@ import hashlib
 import os
 import heapq
 
-class BloomFilter:
-    def __init__(self, size=1000000, hash_count=5):
-        self.size = size
-        self.hash_count = hash_count
-        self.bit_array = [False] * size
-
-    def _hashes(self, item):
-        # Simple string-based hashing for simplicity and to avoid external dependencies
-        hashes = []
-        for i in range(self.hash_count):
-            # Using md5 for fast hashing across multiple seeds
-            h = int(hashlib.md5(f"{item}:{i}".encode('utf-8')).hexdigest(), 16)
-            hashes.append(h % self.size)
-        return hashes
-
-    def add(self, item):
-        for h in self._hashes(item):
-            self.bit_array[h] = True
-
-    def check(self, item):
-        for h in self._hashes(item):
-            if not self.bit_array[h]:
-                return False
-        return True
-
 class TokenBoundedMinHeap:
     def __init__(self, max_tokens):
         self.max_tokens = max_tokens
