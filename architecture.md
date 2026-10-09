@@ -4,9 +4,9 @@ Agent Vault uses classic Data Structures & Algorithms (DSA) combined with an SQL
 
 ## Core Components
 
-### 1. Bloom Filter (`dsa.py`)
-**Purpose**: $O(1)$ fast rejection.
-Before the Vault queries the disk or database to check if a file has been indexed, it checks the in-memory Bloom Filter. If the file is not in the filter, the Vault immediately rejects the request, saving I/O latency.
+### 1. Indexed Fast Rejection (`storage.py`)
+**Purpose**: Cheap misses without hashing the file.
+Before the Vault hashes a file, it looks the path up in `file_cache` by its primary key. If there is no row, the Vault immediately rejects the request without reading the file. Because the check reads the shared database rather than per-process state, every server process (e.g. one per agent session) sees files cached by the others.
 
 ### 2. Token-Bounded Min-Heap (`dsa.py`)
 **Purpose**: Enforce strict context window limits.
