@@ -468,13 +468,24 @@ class VaultStorage:
             if row:
                 cached_digest, entry["summary"] = row
                 head = subprocess.run(['git', 'show', f'HEAD:{rel}'], cwd=top, capture_output=True)
-                head_digest = hashlib.sha256(head.stdout).hexdigest() if head.returncode == 0 else None
+                if head.returncode == 0:
+                    head_content = head.stdout
+                    head_digest1 = hashlib.sha256(head_content).hexdigest()
+                    head_digest2 = hashlib.sha256(head_content.replace(b'
+', b'
+').replace(b'
+', b'
+')).hexdigest()
+                    head_digests = (head_digest1, head_digest2)
+                else:
+                    head_digests = ()
+                
                 if cached_digest == get_file_digest(abs_path)[0]:
                     entry["state"] = "working"
-                elif cached_digest == head_digest:
+                elif cached_digest in head_digests:
                     entry["state"] = "head"
                 else:
-                    entry["state"] = "older"
+                    entry["state"] = "older
             entries.append(entry)
         return entries
 
